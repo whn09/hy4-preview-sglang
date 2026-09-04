@@ -11,7 +11,7 @@
 #
 # What is deliberately NOT passed, because the runtime resolves it for HYV4 and a
 # flag here would cancel that resolution:
-#   --quantization       : read from the checkpoint's ModelOpt hf_quant_config
+#   --quantization       : read from config.json quantization_config (MXFP8)
 #   --attention-backend  : DSA (flashmla_sparse + FP8 indexer cache) is auto-picked
 #   --enable-*-cp / --pp : HYV4ForCausalLM rejects both before allocation
 set -euo pipefail

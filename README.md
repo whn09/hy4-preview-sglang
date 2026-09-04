@@ -40,10 +40,24 @@ intermediate 2048, bounded SwiGLU clamp 10.0.
   ships **inside both checkpoints**, so there is no separate draft path to point
   at. SGLang records it internally as `speculative_algorithm='EAGLE'` with
   `speculative_draft_model_path` = the same checkpoint.
-* **MXFP8** (ModelOpt, UE8M0 group-32 weight scales, dynamic activations)
-  self-describes through the checkpoint's `hf_quant_config`. **Never pass
-  `--quantization`** -- it overrides the checkpoint's own recipe. Requires
-  SM100+; H200/SM90 cannot serve the FP8 checkpoint at all.
+* **MXFP8** (ModelOpt). Straight out of `tencent/Hy4-preview-FP8/config.json`:
+  `"quantization_config": {"quant_method": "modelopt", "quantization":
+  {"quant_algo": "MXFP8", ...}}`. **Never pass `--quantization`** -- it overrides
+  the checkpoint's own recipe. The repo has **no `hf_quant_config.json`** (that is
+  ModelOpt's schema name; here it is inlined into `config.json`).
+
+  sglang maps `quant_algo MXFP8` onto `Fp8Config(weight_block_size=[1,32],
+  use_mxfp8=True)`, so the server logs plain `quant_method=Fp8MoEMethod` even on
+  an MXFP8 checkpoint -- **that log line is not evidence of DeepSeek-style
+  blockwise FP8**, and reading it that way is the obvious wrong turn here.
+
+  **SM100+ only**, from `fp8.py get_min_capability`: `return 100 if self.use_mxfp8
+  else 80`. There is one MXFP8 -> block-fp8[128,128]-at-load path that would run on
+  older parts, but it is **AMD-only** (`mxfp8_block_convert_required()` opens with
+  `if not torch.version.hip: return False`) and it reports capability 94, a gfx942
+  code that SM90's 90 fails regardless. So **H200 cannot serve this FP8 checkpoint**
+  -- source-level, not measured. `tencent/Hy4-preview` (BF16, ~1.5 TB) is the only
+  H200 path, and at 1.5 TB that is 2 nodes / TP16.
 * Text-only: image input is rejected with HTTP 400 **by design**.
 * The model rejects pipeline parallelism and `--enable-prefill-cp` before
   allocation.

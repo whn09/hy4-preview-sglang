@@ -28,10 +28,24 @@ IMAGE="${IMAGE:-lmsysorg/sglang:hy4-preview}"
 # ~190GB/rank at TP8. Both fit a B300 (288GB) node; on 141/192GB parts the BF16
 # arm is a 2-node TP16 recipe instead (not our hardware).
 #
-# MXFP8 needs SM100+. It self-describes through the checkpoint's ModelOpt
-# hf_quant_config (UE8M0 group-32 weight scales, dynamic activations), so there
-# is deliberately no --quantization flag anywhere in this kit -- passing one
-# would override the checkpoint's own recipe.
+# MXFP8 needs SM100+, and it self-describes, so there is deliberately no
+# --quantization flag anywhere in this kit -- passing one would override the
+# checkpoint's own recipe. Verbatim from tencent/Hy4-preview-FP8 config.json:
+#
+#   "quantization_config": {"quant_method": "modelopt",
+#     "quantization": {"quant_algo": "MXFP8", "kv_cache_quant_algo": null,
+#                      "exclude_modules": [...]}}
+#
+# Note the repo has NO hf_quant_config.json (HTTP "Entry not found", checked
+# 2026-09-04) -- that is ModelOpt's schema name, but here it is inlined into
+# config.json. sglang maps quant_algo MXFP8 onto Fp8Config(weight_block_size=[1,32],
+# use_mxfp8=True), which is why the server logs plain `quant_method=Fp8MoEMethod`
+# on an MXFP8 checkpoint; that log line is NOT evidence of blockwise FP8.
+# The SM100 floor is fp8.py `get_min_capability`: `return 100 if self.use_mxfp8
+# else 80`. The one escape hatch (MXFP8 -> block-fp8 [128,128] at load, which
+# would run on older parts) is AMD-only: mxfp8_block_convert_required() opens
+# with `if not torch.version.hip: return False`, and it reports capability 94,
+# a gfx942 code that SM90's 90 would fail anyway.
 QUANT="${QUANT:-mxfp8}"
 case "$QUANT" in
     mxfp8)
