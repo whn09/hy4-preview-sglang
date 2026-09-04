@@ -1,0 +1,71 @@
+# Hy4-preview + `--moe-a2a-backend deepep_v2`, on the STOCK image.
+#
+#   docker build -t hy4-preview-v2:latest -f Dockerfile.deepep_v2 .
+#
+# Deliberately thin. The other Dockerfile in this kit swaps NCCL, adds the EFA
+# stack and replaces the Mooncake wheel, all of which a PD run needs and none of
+# which deepep_v2 needs -- and every one of them is a second axis in any
+# v2-vs-v1 comparison. This image changes exactly three Python files and nothing
+# else, so `deepep` on the stock image and `deepep_v2` on this one differ only in
+# the thing under test. Builds in about a minute; no compiler runs.
+#
+# The stock image already ships `deep_ep` and `deep_gemm`
+# (/usr/local/lib/python3.12/dist-packages), so there is nothing to install.
+#
+# Per-blocker root cause, and why Hy4 needs 3 patches where Kimi-K3 needed 5, is
+# in patches/README.md.
+ARG BASE_IMAGE=lmsysorg/sglang:hy4-preview
+FROM ${BASE_IMAGE}
+
+# ---- DeepEP v2 source patches ----
+#   moe_hook.py      HYV4ForCausalLM added to the deepep_v2 model whitelist.
+#   fmt_layer.py     the deepep_v2 quant gate, which rejects MXFP8 outright even
+#                    though both deep_gemm v2 paths have a use_mxfp8 branch.
+#   mr_deep_gemm.py  two hunks, and this is the one that is NOT just a loosened
+#                    gate: the MXFP8 activation granularity is a property of the
+#                    dispatch path, and the v2 pre-permute never set it. Without
+#                    it the gateup GEMM reads a 128-group activation scale as a
+#                    32-group one.
+#
+# Applied by TARGET PATH rather than -p<n>, because the diffs are captured
+# against a docker-cp'd copy and no strip level reaches the real tree.
+#
+# The loop is idempotent AND fail-closed. If one of these lands upstream, a plain
+# `patch` would fail and (with `|| true`) leave a half-patched image whose only
+# symptom is wrong logits -- so: try forward, else accept an already-applied file
+# only when a REVERSE dry-run succeeds, else FAIL THE BUILD. A build break here
+# is the intended signal to go check whether the base image moved.
+COPY patches/ /opt/hy4-patches/
+RUN set -eu; \
+    SGL=$(python3 -c "import sglang, os; print(os.path.dirname(sglang.__file__))"); \
+    echo "sglang tree: $SGL"; \
+    apply_one() { \
+      diff_file="/opt/hy4-patches/$1"; target="$SGL/$2"; \
+      test -f "$target" || { echo "FATAL: patch target missing: $target"; exit 1; }; \
+      if patch --forward --dry-run "$target" "$diff_file" >/dev/null 2>&1; then \
+        patch --forward "$target" "$diff_file" >/dev/null && echo "  applied  $1 -> $2"; \
+      elif patch --reverse --dry-run "$target" "$diff_file" >/dev/null 2>&1; then \
+        echo "  SKIP     $1 -> $2 (already present in this base image)"; \
+      else \
+        echo "FATAL: $1 does not apply to $target and is not already applied."; \
+        echo "       The base image moved. See patches/README.md, re-cut the"; \
+        echo "       diff, or delete it if the upstream PR merged."; \
+        exit 1; \
+      fi; \
+    }; \
+    apply_one moe_hook.diff     srt/arg_groups/moe_hook.py; \
+    apply_one fmt_layer.diff    srt/layers/moe/fused_moe_triton/layer.py; \
+    apply_one mr_deep_gemm.diff srt/layers/moe/moe_runner/deep_gemm.py; \
+    echo "all three DeepEP v2 patches accounted for"
+
+# A launcher-readable marker, so require_deepep_v2_image() can refuse to start a
+# v2 arm on the stock image instead of letting the whitelist error look like a
+# flag typo. Checked by grep, not by importing sglang -- there is no GPU in a
+# build and none is needed to read a file.
+RUN set -eu; \
+    SGL=$(python3 -c "import sglang, os; print(os.path.dirname(sglang.__file__))"); \
+    grep -q HYV4ForCausalLM "$SGL/srt/arg_groups/moe_hook.py"; \
+    grep -q "HYV4, MXFP8 on deepep_v2" "$SGL/srt/layers/moe/fused_moe_triton/layer.py"; \
+    grep -q "HYV4 MXFP8 on deepep_v2" "$SGL/srt/layers/moe/moe_runner/deep_gemm.py"; \
+    echo hy4-deepep-v2-patched > /etc/hy4-deepep-v2-patched; \
+    cat /etc/hy4-deepep-v2-patched

@@ -10,6 +10,10 @@
 #   EP_SIZE=8 bash 10_launch_standalone.sh                # EP, no all-to-all library
 #   A2A_BACKEND=deepep bash 10_launch_standalone.sh       # DeepEP; forces EP = TP
 #   DP_ATTN=8 EP_SIZE=8 bash 10_launch_standalone.sh      # + attention DP
+#   IMAGE=hy4-preview-v2:latest A2A_BACKEND=deepep_v2 CHUNKED_PREFILL=2048 \
+#     bash 10_launch_standalone.sh    # DeepEP v2; PATCHED image, chunk <= V2_CAP.
+#                                     # Give the v1 arm the SAME CHUNKED_PREFILL
+#                                     # or the pair also differs in chunk size.
 #
 # Cross-node (TP16 BF16 over EFA -- not a cookbook-verified cell): same command
 # on both hosts but NODE_RANK, and DIST_INIT_ADDR is rank 0's IP on both. Only
@@ -31,6 +35,9 @@ require_weights
 # the same env vars, so this is a fail-fast gate, not a second source of truth.
 build_moe_args
 [[ "$A2A_BACKEND" == "deepep" ]] && require_deepep_image "$IMAGE"
+# deepep_v2 needs three source patches, one of which is a numerics fix, so
+# the image is verified by a marker rather than trusted.
+[[ "$A2A_BACKEND" == "deepep_v2" ]] && require_deepep_v2_image "$IMAGE"
 
 # Pin the ranks rather than exposing all 8 GPUs even at TP8: the device set then
 # belongs to the container's config instead of being an accident of which GPUs
@@ -77,6 +84,7 @@ docker run -d --name "$NAME" \
     -e DEEPEP_MODE="$DEEPEP_MODE" \
     -e DP_ATTN="${DP_ATTN:-}" \
     -e ALLOW_UNVALIDATED_A2A="${ALLOW_UNVALIDATED_A2A:-0}" \
+    -e V2_CAP="$V2_CAP" \
     -e MODEL_PATH="$MODEL_PATH" \
     -e SERVED_MODEL_NAME="$SERVED_MODEL_NAME" \
     -e CONTEXT_LEN="${CONTEXT_LEN:-}" \
@@ -95,7 +103,7 @@ docker run -d --name "$NAME" \
     /host/hy4-preview-sglang/start_server.sh
 
 echo "launched '$NAME': quant=$QUANT tp=$TP_SIZE gpus=$GPU_LIST profile=$PROFILE spec=$SPEC image=$IMAGE"
-echo "  moe   : a2a=$A2A_BACKEND ep=$EP_EFF moe_tp=$(( TP_SIZE / EP_EFF )) dp_attn=${DP_ATTN:-off}"
+echo "  moe   : a2a=$A2A_BACKEND ep=$EP_EFF moe_tp=$(( TP_SIZE / EP_EFF )) dp_attn=${DP_ATTN:-off}$([[ "$A2A_BACKEND" == "deepep_v2" ]] && echo " v2_cap=$V2_CAP")"
 echo "  topo  : ${TOPO:-tp${TP_SIZE}x${NNODES}node${MOE_TAG}}"
 if (( NNODES > 1 )); then
     echo "  tp=$TP_SIZE over $NNODES nodes, this host is node-rank $NODE_RANK, rendezvous ${DIST_INIT_ADDR}:${DIST_INIT_PORT}"

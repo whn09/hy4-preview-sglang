@@ -1,0 +1,39 @@
+--- a/python/sglang/srt/layers/moe/moe_runner/deep_gemm.py
++++ b/python/sglang/srt/layers/moe/moe_runner/deep_gemm.py
+@@ -360,7 +360,19 @@
+         scale_block_size = quant_info.block_shape[1] if quant_info.use_mxfp8 else 128
+ 
+         if quant_info.use_mxfp8:
+-            recipe_a = recipe_b = tuple(quant_info.block_shape)
++            # LOCAL EXPERIMENT ONLY (HYV4 MXFP8 on deepep_v2). The gateup
++            # activation granularity is a property of the DISPATCH path, not of
++            # the checkpoint: standard = block_shape[1], DeepEP-LL and DeepEP v2
++            # = 128. _run_masked_gemm already reads it from running_state (:640)
++            # with the same default; this path inferred it from block_shape and
++            # so mis-read a 128-group v2 activation scale as a 32-group one.
++            # For every non-v2 dispatch the .get() returns block_shape[1], i.e.
++            # byte-identical to the previous behaviour.
++            gran_k_act = running_state.get(
++                "mxfp8_act_gran_k", quant_info.block_shape[1]
++            )
++            recipe_b = tuple(quant_info.block_shape)
++            recipe_a = (quant_info.block_shape[0], gran_k_act)
+         elif quant_info.is_fp4_experts:
+             recipe_a, recipe_b = (1, 128), (1, 32)
+         else:
+@@ -1536,6 +1548,15 @@
+             "scales, but the dispatch output carried none."
+         )
+     assert runner_config.activation == "silu"
++    # LOCAL EXPERIMENT ONLY (HYV4 MXFP8 on deepep_v2). The v2 dispatcher
++    # quantises activations at a fixed 128 group regardless of the checkpoint's
++    # weight block_shape (token_dispatcher/deepep_v2.py:27 _SCALE_BLOCK_SIZE),
++    # exactly like DeepEP-LL at :1144. Without this the MXFP8 gateup recipe_a
++    # defaults to block_shape[1] = 32 and the scale-shape assert at :645 fires
++    # (K=6144: it expects ceil_div(6144, 32*4) = 48 lanes but the dispatch
++    # carries ceil_div(6144/128, 4) = 12). Harmless on non-MXFP8 checkpoints,
++    # which never read this key.
++    running_state["mxfp8_act_gran_k"] = 128
+ 
+     if is_expanded:
+         if psum_num_recv_tokens_per_expert is None:

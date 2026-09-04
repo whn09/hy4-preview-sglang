@@ -1,0 +1,28 @@
+--- a/python/sglang/srt/layers/moe/fused_moe_triton/layer.py
++++ b/python/sglang/srt/layers/moe/fused_moe_triton/layer.py
+@@ -241,6 +241,25 @@
+     if not get_moe_a2a_backend().is_deepep_v2():
+         return
+ 
++    # LOCAL EXPERIMENT ONLY (Hy4-preview / HYV4, MXFP8 on deepep_v2). This gate
++    # is stricter than the kernels behind it: BOTH deep_gemm v2 paths already
++    # carry a full use_mxfp8 branch -- moe_runner/deep_gemm.py:362 contiguous and
++    # :637 masked -- selecting recipe_b = block_shape = (1,32) and a recipe_a
++    # whose granularity comes from the dispatch path via
++    # running_state["mxfp8_act_gran_k"]. The v2 dispatcher emits per-token
++    # 128-group FP8 (token_dispatcher/deepep_v2.py:27 _SCALE_BLOCK_SIZE = 128),
++    # exactly like DeepEP-LL, so mr_deep_gemm.diff sets that key to 128 on the v2
++    # pre-permute. Numerics MUST be validated against a --moe-a2a-backend deepep
++    # baseline; passing this gate is not a correctness proof.
++    if (
++        isinstance(quant_method, Fp8MoEMethod)
++        and quant_method.use_mxfp8
++        and not quant_method.is_fp4_expert
++        and list(quant_method.weight_block_size or []) == [1, 32]
++        and get_moe_runner_backend().is_deep_gemm()
++    ):
++        return
++
+     config = (
+         quant_method.quant_config if isinstance(quant_method, Fp8MoEMethod) else None
+     )

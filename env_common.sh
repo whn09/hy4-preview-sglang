@@ -117,6 +117,19 @@ DEEPEP_MODE="${DEEPEP_MODE:-auto}"  # auto | normal | low_latency
 # part of any verified cell, and on an MLA model it changes the KV pool shape, so
 # it is an axis of its own -- hence it is in the results tag below.
 DP_ATTN="${DP_ATTN:-}"            # empty/off => no DP attention
+# deepep_v2 only. The per-rank ElasticBuffer dispatch capacity, an ENV VAR
+# upstream (SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK), not a flag.
+# validate_deepep_v2_dispatch_token_budget() (moe_hook.py:361) checks it against
+# TWO budgets, and both bind here:
+#   prefill  max_prefill_buffer_tokens() = chunked_prefill_size <= capacity, and
+#            on a >160 GiB GPU memory_hook.py:124 defaults chunked_prefill_size to
+#            16384 -- 8x the default below -- so a v2 arm cannot boot until
+#            CHUNKED_PREFILL is lowered. build_moe_args() below requires it.
+#   decode   decode_graph_bs * tokens_per_request <= capacity, tokens/req = 4 with
+#            MTP on, and cuda_graph max_bs defaults to 512 on this GPU.
+# It costs GPU MEMORY -- on K3 the buffer ran ~10.5 GiB per 1024 of capacity, so
+# this is the first thing to lower on an OOM, and Hy4's own ceiling is unmeasured.
+V2_CAP="${V2_CAP:-2048}"
 N_ROUTED_EXPERTS=256              # config.json n_routed_experts
 MOE_INTERMEDIATE=2048             # config.json moe_intermediate_size
 
@@ -249,6 +262,14 @@ setup_runtime_env() {
     fi
     export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
 
+    # ---- deepep_v2 only: the dispatch capacity, which is an env var upstream ----
+    # Exported here rather than in the launcher so the value the SERVER sees is the
+    # value this file documents, and so 91_bench.sh can read it back out of the
+    # running container for the results header.
+    if [[ "${A2A_BACKEND:-none}" == "deepep_v2" ]]; then
+        export SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK="${V2_CAP}"
+    fi
+
     # ---- PD-only: KV transfer over EFA ----
     if [[ -n "${PD_ROLE:-}" ]]; then
         # Mooncake's protocol selector. "efa" is not the default; without it the
@@ -336,18 +357,69 @@ build_moe_args() {
             EP_EFF="$TP_SIZE"
             ;;
         deepep_v2)
-            # Hard refusal, and not a judgement call: moe_hook.py's
-            # validate_deepep_v2_model_architecture() whitelists exactly
-            # ("DeepseekV3ForCausalLM", "DeepseekV4ForCausalLM",
-            # "Qwen3MoeForCausalLM") and raises ValueError for anything else.
-            # Hy4's config.json declares architectures ["HYV4ForCausalLM"], so
-            # this dies at config resolution -- before allocation, with a
-            # message about all-reduce after A2A combine.
-            echo "ERROR: A2A_BACKEND=deepep_v2 cannot run HYV4ForCausalLM." >&2
-            echo "       sglang's validate_deepep_v2_model_architecture() allows only" >&2
-            echo "       DeepseekV3/V4 and Qwen3Moe: other models may need an all-reduce" >&2
-            echo "       after A2A combine, which the v2 path skips. Use deepep." >&2
-            exit 1 ;;
+            # Runs only on the PATCHED image. Three upstream gates stand in the
+            # way and all three are in patches/ (root cause per blocker in
+            # patches/README.md):
+            #   1. validate_deepep_v2_model_architecture() whitelists exactly
+            #      DeepseekV3/V4 + Qwen3Moe; Hy4 declares ["HYV4ForCausalLM"].
+            #   2. _validate_deepep_v2_quant_method() rejects MXFP8 outright.
+            #   3. the v2 pre-permute never sets mxfp8_act_gran_k, so the gateup
+            #      GEMM would read the dispatcher's 128-group activation scale as
+            #      a 32-group one.
+            # (1) and (2) fail loudly at config resolution. (3) is the reason this
+            # is not just "delete a whitelist": it is a real numerics bug on an
+            # MXFP8 checkpoint. IMAGE must therefore be the patched one --
+            # require_deepep_v2_image() checks that, and the launchers call it.
+            if [[ -n "$EP_SIZE" && "$EP_SIZE" != "$TP_SIZE" ]]; then
+                echo "ERROR: A2A_BACKEND=deepep_v2 forces EP = TP (= $TP_SIZE); EP_SIZE=$EP_SIZE cannot run." >&2
+                exit 1
+            fi
+            # BF16 cannot reach the v2 path at all, patched or not: the quant gate
+            # rejects anything that is not an Fp8MoEMethod first, and the patch
+            # only widens the MXFP8 case. Unquantized experts would report
+            # "selected UnquantizedFusedMoEMethod" and there is no kernel behind
+            # that on the v2 runner, so this is a real limit, not a loosenable one.
+            if [[ "${QUANT:-mxfp8}" != "mxfp8" ]]; then
+                echo "ERROR: A2A_BACKEND=deepep_v2 needs FP8 experts; QUANT=$QUANT has none." >&2
+                echo "       _validate_deepep_v2_quant_method() rejects non-Fp8MoEMethod" >&2
+                echo "       layers before the patch is ever consulted. Use A2A_BACKEND=deepep." >&2
+                exit 1
+            fi
+            # The capacity also caps the PREFILL chunk, and this is what stops a
+            # default v2 launch: validate_deepep_v2_dispatch_token_budget()
+            # compares max_prefill_buffer_tokens() (= chunked_prefill_size) with the
+            # capacity, and memory_hook.py:124 defaults chunked_prefill_size to
+            # 16384 on a >160 GiB GPU. Refuse rather than auto-lower it: a chunk
+            # size the launcher chose for v2 alone would make every prefill number a
+            # chunk-size comparison as well as a backend comparison.
+            if [[ -z "${CHUNKED_PREFILL:-}" ]]; then
+                echo "ERROR: A2A_BACKEND=deepep_v2 needs CHUNKED_PREFILL set explicitly." >&2
+                echo "       sglang defaults chunked_prefill_size to 16384 on this GPU," >&2
+                echo "       and the v2 budget check then refuses at config resolution:" >&2
+                echo "         required=16384, capacity=$V2_CAP" >&2
+                echo "       Use CHUNKED_PREFILL=$V2_CAP (anything <= V2_CAP), and pass the" >&2
+                echo "       SAME CHUNKED_PREFILL to the v1 deepep baseline -- otherwise the" >&2
+                echo "       two arms differ in chunk size as well as in backend." >&2
+                exit 1
+            fi
+            if (( CHUNKED_PREFILL > V2_CAP )); then
+                echo "ERROR: CHUNKED_PREFILL=$CHUNKED_PREFILL exceeds V2_CAP=$V2_CAP. The per-rank" >&2
+                echo "       prefill budget must fit the dispatch capacity; raise V2_CAP (it" >&2
+                echo "       costs ~10.5 GiB per 1024 on K3) or lower the chunk." >&2
+                exit 1
+            fi
+            # The decode half of the same check. graph_bs is min(cuda_graph max_bs,
+            # max_running_requests/dp_attn) and this shell cannot resolve the
+            # runtime's own max_running_requests, so warn with the arithmetic
+            # instead of guessing -- upstream's error names the exact numbers.
+            if [[ "$SPEC" == "on" && -z "${MAX_RUNNING:-}" ]] && (( V2_CAP < 4 * 512 )); then
+                echo "WARN: MTP is on (4 tokens/request) and cuda_graph max_bs defaults to" >&2
+                echo "      512 here, so the decode graph asks for 2048 > V2_CAP=$V2_CAP." >&2
+                echo "      Set MAX_RUNNING <= $(( V2_CAP / 4 )) (or raise V2_CAP) if the server" >&2
+                echo "      refuses with 'decode CUDA graph exceeds'." >&2
+            fi
+            EP_EFF="$TP_SIZE"
+            ;;
         megamoe)
             echo "ERROR: A2A_BACKEND=megamoe is not wired for Hy4's sigmoid-scored," >&2
             echo "       bounded-SwiGLU experts (the cookbook omits it deliberately)." >&2
@@ -430,6 +502,19 @@ build_moe_args() {
     # other arm's log.
     [[ "$A2A_BACKEND" != "none" ]] && MOE_TAG="${MOE_TAG}-a2a${A2A_BACKEND}"
     [[ "$A2A_BACKEND" == "deepep" && "$DEEPEP_MODE" != "auto" ]] && MOE_TAG="${MOE_TAG}${DEEPEP_MODE}"
+    # The v2 capacity is an axis, not a detail: it bounds the decode CUDA graph and
+    # sizes the ElasticBuffer, so a cap-512 row and a cap-2048 row must not share a
+    # filename.
+    [[ "$A2A_BACKEND" == "deepep_v2" ]] && MOE_TAG="${MOE_TAG}cap${V2_CAP}"
+    # CHUNKED_PREFILL is not a MoE knob, but MOE_TAG is the only fragment that
+    # reaches the results filename (91_bench.sh builds TAG from TOPO), and the v2
+    # arm cannot run at the default chunk -- so a v2 row and any earlier
+    # default-chunk row would otherwise collide on one name.
+    [[ -n "${CHUNKED_PREFILL:-}" ]] && MOE_TAG="${MOE_TAG}-chunk${CHUNKED_PREFILL}"
+    # Same argument for the admission cap: it is how a low V2_CAP is made to fit
+    # the decode graph, and it is the ceiling on offered concurrency, so a
+    # MAX_RUNNING=16 row must not land on the unpinned row's filename.
+    [[ -n "${MAX_RUNNING:-}" ]] && MOE_TAG="${MOE_TAG}-mr${MAX_RUNNING}"
     (( EP_EFF > 1 )) && MOE_TAG="${MOE_TAG}-ep${EP_EFF}"
     [[ -n "$DP_ATTN" && "$DP_ATTN" != "off" && "$DP_ATTN" != "0" ]] && MOE_TAG="${MOE_TAG}-dp${DP_ATTN}"
     return 0
@@ -453,6 +538,31 @@ require_deepep_image() {
         echo "       Either use A2A_BACKEND=none EP_SIZE=$TP_SIZE (expert parallelism" >&2
         echo "       with no all-to-all library, which needs nothing extra), or add" >&2
         echo "       DeepEP to the image." >&2
+        exit 1
+    fi
+}
+
+# Host-side gate for the deepep_v2 arm. Unlike require_deepep_image() this is not
+# about a missing library -- the stock image HAS deep_ep -- it is about three
+# source patches. Two of them fail loudly if absent, but the third
+# (mxfp8_act_gran_k on the v2 pre-permute) is a NUMERICS fix: an unpatched image
+# that somehow got past the other two would serve wrong logits, not crash. So the
+# marker is checked, not assumed.
+#
+# Reads a file rather than importing sglang: no --gpus here, and `import sglang`
+# on a GPU-less container is not a reliable probe.
+require_deepep_v2_image() {
+    local img="$1"
+    if ! docker run --rm --entrypoint cat "$img" /etc/hy4-deepep-v2-patched >/dev/null 2>&1; then
+        echo "ERROR: image '$img' is not the deepep_v2-patched image." >&2
+        echo "       Build it (about a minute, no compiler runs):" >&2
+        echo "         docker build -t hy4-preview-v2:latest -f Dockerfile.deepep_v2 ." >&2
+        echo "       then: IMAGE=hy4-preview-v2:latest A2A_BACKEND=deepep_v2 ..." >&2
+        echo "       Three upstream gates block v2 on HYV4 and one of them is a" >&2
+        echo "       numerics bug on MXFP8, so this is not skippable -- see" >&2
+        echo "       patches/README.md. Unpatched alternatives that do work today:" >&2
+        echo "         A2A_BACKEND=deepep            (v1, stock image)" >&2
+        echo "         A2A_BACKEND=none EP_SIZE=$TP_SIZE  (masked EP, no library)" >&2
         exit 1
     fi
 }

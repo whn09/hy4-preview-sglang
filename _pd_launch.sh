@@ -28,6 +28,9 @@ require_weights
 # cannot verify against, and nothing negotiates it at handshake time.
 build_moe_args
 [[ "$A2A_BACKEND" == "deepep" ]] && require_deepep_image "$IMAGE"
+# deepep_v2 needs three source patches, one of which is a numerics fix, so
+# the image is verified by a marker rather than trusted.
+[[ "$A2A_BACKEND" == "deepep_v2" ]] && require_deepep_v2_image "$IMAGE"
 
 # Pin the ranks rather than exposing all 8 GPUs: the device set becomes part of
 # the container's config instead of an accident of enumeration order, and at
@@ -87,6 +90,7 @@ docker run -d --name "$NAME" \
     -e DEEPEP_MODE="$DEEPEP_MODE" \
     -e DP_ATTN="${DP_ATTN:-}" \
     -e ALLOW_UNVALIDATED_A2A="${ALLOW_UNVALIDATED_A2A:-0}" \
+    -e V2_CAP="$V2_CAP" \
     -e MODEL_PATH="$MODEL_PATH" \
     -e SERVED_MODEL_NAME="$SERVED_MODEL_NAME" \
     -e CONTEXT_LEN="${CONTEXT_LEN:-}" \
@@ -106,7 +110,7 @@ docker run -d --name "$NAME" \
 
 echo "launched '$NAME': role=$PD_ROLE backend=${TRANSFER_BACKEND:-mooncake} quant=$QUANT tp=$TP_SIZE gpus=$GPU_LIST spec=$SPEC"
 echo "  image : $IMAGE"
-echo "  moe   : a2a=$A2A_BACKEND ep=$EP_EFF moe_tp=$(( TP_SIZE / EP_EFF )) dp_attn=${DP_ATTN:-off}"
+echo "  moe   : a2a=$A2A_BACKEND ep=$EP_EFF moe_tp=$(( TP_SIZE / EP_EFF )) dp_attn=${DP_ATTN:-off}$([[ "$A2A_BACKEND" == "deepep_v2" ]] && echo " v2_cap=$V2_CAP")"
 echo "  topo  : $TOPO   (tok/s/GPU denominator = $BENCH_GPUS)"
 echo "  http  : 0.0.0.0:${PORT}   bootstrap: ${BOOTSTRAP_PORT}"
 echo "  logs  : docker logs -f $NAME"

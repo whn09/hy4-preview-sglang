@@ -62,6 +62,17 @@ RUN_A2A="$(read_cenv "$SRV" A2A_BACKEND "${A2A_BACKEND:-none}")"
 RUN_EP="$(read_cenv "$SRV" EP_SIZE "${EP_SIZE:-}")"
 [[ "$RUN_A2A" != "none" && "$RUN_A2A" != "unknown" ]] && RUN_EP="$RUN_TP"
 RUN_DPATTN="$(read_cenv "$SRV" DP_ATTN "${DP_ATTN:-}")"
+# deepep_v2 only, and it is an axis: the capacity bounds the decode CUDA graph
+# and sizes the ElasticBuffer, so two v2 rows at different caps are not
+# comparable. Read the env var the SERVER got, not the launcher knob.
+RUN_V2CAP="$(read_cenv "$SRV" SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK "")"
+# The chunk is coupled to that capacity (the v2 budget check refuses a chunk larger
+# than the cap), so it belongs in the header next to it: "default" means the
+# runtime picked it -- 16384 on this GPU -- not that it does not matter.
+RUN_CHUNK="$(read_cenv "$SRV" CHUNKED_PREFILL "${CHUNKED_PREFILL:-}")"
+# The admission cap bounds offered concurrency, so a c=256 run behind max_running=48
+# is a 48-slot run: report it next to the concurrency it was asked for.
+RUN_MAXRUN="$(read_cenv "$SRV" MAX_RUNNING "${MAX_RUNNING:-}")"
 
 RESULTS_DIR="${RESULTS_DIR:-$SCRIPT_DIR_HOST/results}"
 TAG="${TAG:-${RUN_QUANT}-${RUN_TOPO}-${RUN_PROF}-spec${RUN_SPEC}-isl${ISL}-osl${OSL}-c${CONCURRENCY}-n${NUM_PROMPTS}}"
@@ -77,8 +88,8 @@ echo "log  : ${LOG}"
   echo "### endpoint=${ENDPOINT} image=$(docker inspect -f '{{.Config.Image}}' "$SRV" 2>/dev/null || echo unknown)"
   echo "### quant=${RUN_QUANT} tp=${RUN_TP} nnodes=${RUN_NN} profile=${RUN_PROF} spec=${RUN_SPEC}"
   echo "### topo=${RUN_TOPO} gpus=${RUN_GPUS} backend=$(read_cenv "$SRV" TRANSFER_BACKEND none)"
-  echo "### moe_a2a=${RUN_A2A} ep=${RUN_EP:-1} dp_attn=${RUN_DPATTN:-off}"
-  echo "### isl=${ISL} osl=${OSL} num_prompts=${NUM_PROMPTS} concurrency=${CONCURRENCY}"
+  echo "### moe_a2a=${RUN_A2A} ep=${RUN_EP:-1} dp_attn=${RUN_DPATTN:-off} v2_cap=${RUN_V2CAP:-n/a} chunk=${RUN_CHUNK:-default}"
+  echo "### isl=${ISL} osl=${OSL} num_prompts=${NUM_PROMPTS} concurrency=${CONCURRENCY} max_running=${RUN_MAXRUN:-auto}"
   echo "### started=$(date -u +%FT%TZ)"
 } > "$LOG"
 

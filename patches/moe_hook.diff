@@ -1,0 +1,16 @@
+--- a/python/sglang/srt/arg_groups/moe_hook.py
++++ b/python/sglang/srt/arg_groups/moe_hook.py
+@@ -428,6 +428,13 @@
+         "DeepseekV3ForCausalLM",
+         "DeepseekV4ForCausalLM",
+         "Qwen3MoeForCausalLM",
++        # LOCAL EXPERIMENT ONLY. HYV4's sparse layers ARE DeepseekV2MoE
++        # (models/hunyuan_v4.py:533), i.e. literally the DeepseekV3 MoE region
++        # that is whitelisted above, and hunyuan_v4.py keeps no a2a bookkeeping
++        # of its own -- so the "may require an all-reduce after A2A combine"
++        # hazard this list guards against does not apply. Numerics must still be
++        # validated against a --moe-a2a-backend deepep baseline.
++        "HYV4ForCausalLM",
+     )
+     if architecture not in validated_architectures:
+         raise ValueError(

@@ -23,6 +23,18 @@ export HF_HUB_DOWNLOAD_TIMEOUT=60
 
 mkdir -p "$MODEL_DIR" "$HF_HOME_DIR"
 
+# A freshly relaunched DLAMI has no `hf` CLI in /opt/pytorch, and the failure is
+# a bare "hf: command not found" 1 second into a nohup'd download -- i.e. it looks
+# like the download is running for as long as nobody reads the log. Install it
+# here rather than documenting it as a prerequisite. hf_xet is what makes
+# HF_XET_HIGH_PERFORMANCE above mean anything.
+if ! command -v hf >/dev/null 2>&1; then
+    echo "==> hf CLI missing (fresh instance); installing huggingface_hub[cli,hf_xet]"
+    pip install -q -U "huggingface_hub[cli,hf_xet]"
+    command -v hf >/dev/null 2>&1 || { echo "hf still not on PATH after install" >&2; exit 1; }
+fi
+hf version 2>/dev/null || true
+
 dl() {
     local repo="$1" dest="$2"
     echo "==> $repo -> $dest"

@@ -11,10 +11,10 @@
 set -euo pipefail
 
 cd "$(dirname "$0")"
-# B300-3 is the free pair member; B300-1/B300-2 were running the K3 arms when this
-# kit was brought up. Set HOSTS explicitly for anything else -- and note that
-# P6-B300-* in ~/.ssh/config are a COLLEAGUE's machines, not ours.
-HOSTS="${HOSTS:-B300-3}"
+# All four nodes are ours as of the 2026-09-05 relaunch (the K3 arms that owned
+# B300-1/B300-2 are gone). Note that P6-B300-* in ~/.ssh/config are a COLLEAGUE's
+# machines, not ours -- only the B300-N aliases.
+HOSTS="${HOSTS:-B300-1 B300-2 B300-3 B300-4}"
 REMOTE="${REMOTE:-/home/ubuntu/hy4-preview-sglang}"
 
 push() {

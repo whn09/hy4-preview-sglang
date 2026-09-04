@@ -115,15 +115,20 @@ concurrency, and expect the TP8 arm to win where the TP4 arm was pool-limited.
 
 ## MoE parallelism: EP and the a2a backends
 
-Short answers: **EP=8 works and is one env var**, `deepep` is the only
-all-to-all backend the cookbook offers for this model, and `deepep_v2` is
-**hard-blocked** by an architecture whitelist upstream.
+Short answers: **EP=8 works and is one env var**, `deepep` is the only all-to-all
+backend the cookbook offers for this model, and `deepep_v2` is blocked on the
+stock image but **runs on a patched one** -- three source patches, one of which is
+a numerics fix rather than a loosened gate (`patches/README.md`).
 
 ```bash
 EP_SIZE=8 bash 10_launch_standalone.sh                 # EP, no a2a library
 A2A_BACKEND=deepep bash 10_launch_standalone.sh        # DeepEP (forces EP = TP)
 DEEPEP_MODE=low_latency A2A_BACKEND=deepep bash 10_launch_standalone.sh
 DP_ATTN=8 EP_SIZE=8 bash 10_launch_standalone.sh       # + attention DP
+
+docker build -t hy4-preview-v2:latest -f Dockerfile.deepep_v2 .   # ~1 min
+IMAGE=hy4-preview-v2:latest A2A_BACKEND=deepep_v2 CHUNKED_PREFILL=2048 \
+  bash 10_launch_standalone.sh                         # DeepEP v2, patched image
 ```
 
 ### EP=8 is arithmetically free on this model
@@ -175,7 +180,7 @@ for **this** model:
 |---|---|---|
 | `none` (default) | runs | the verified cell: pure TP MoE, or masked EP when `EP_SIZE>1` |
 | `deepep` | runs | the cookbook's own experimentation override, `EP = TP` |
-| `deepep_v2` | **refused** | `validate_deepep_v2_model_architecture()` whitelists exactly `DeepseekV3ForCausalLM`, `DeepseekV4ForCausalLM`, `Qwen3MoeForCausalLM`; Hy4 is `HYV4ForCausalLM`, so it raises before allocation ("other model workflows may require an all-reduce after A2A combine") |
+| `deepep_v2` | patched image only | three upstream blockers, all in `patches/`: the architecture whitelist (`DeepseekV3/V4`, `Qwen3Moe` -- Hy4 is `HYV4ForCausalLM`), the quant gate rejecting MXFP8, and `mxfp8_act_gran_k` never being set on the v2 pre-permute. `require_deepep_v2_image()` refuses the stock image up front |
 | `megamoe` | **refused** | the cookbook omits it: its fused path is not wired for Hy4's sigmoid-scored, bounded-SwiGLU experts |
 | `mori` | **refused** | ROCm |
 | `ascend_fuseep`, `ascend_tp` | **refused** | Ascend NPU |
@@ -188,12 +193,12 @@ because a typo between them would otherwise "work".
 
 ### Things to know before reading an EP number
 
-* **DeepEP has to be in the image.** The stock `lmsysorg/sglang:hy4-preview` is
-  built for pure-TP recipes and is not required to ship `deep_ep`;
-  `require_deepep_image()` checks `find_spec("deep_ep")` on the host *before* the
-  ~10 min weight load, so the failure costs a second instead of ten minutes. This
-  is unverified either way on the current image -- the check exists precisely
-  because we have not been able to look.
+* **DeepEP is in the image** -- checked: the stock `lmsysorg/sglang:hy4-preview`
+  ships both `deep_ep` and `deep_gemm` in
+  `/usr/local/lib/python3.12/dist-packages`, so nothing needs installing for either
+  DeepEP arm. `require_deepep_image()` stays, because it checks
+  `find_spec("deep_ep")` on the host *before* the ~10 min weight load and the next
+  base image is not obliged to keep the module.
 * **`DEEPEP_MODE=normal` disables CUDA graphs for both phases**
   (`moe_hook.py`: "Cuda graph is disabled because deepep_mode=`normal`"). Any
   latency comparison against another arm then also carries graph-on/graph-off,
@@ -209,13 +214,28 @@ because a typo between them would otherwise "work".
   `_masked_activation_unsupported_reason()` requires group 128, MXFP8 is group 32,
   so the masked standard layout is off and the log says so. That is pre-existing
   at TP4/EP1, not something EP introduces -- do not read it as an EP failure.
+* **The `deepep_v2` arm needs `CHUNKED_PREFILL`, and needs it on the baseline
+  too.** Its per-rank dispatch capacity is an env var
+  (`SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK`, exposed here as `V2_CAP`,
+  default 2048) and the budget check compares it against `chunked_prefill_size`,
+  which the runtime defaults to **16384** on a 279 GiB B300. So the v2 arm cannot
+  boot at the default chunk; `build_moe_args()` refuses without `CHUNKED_PREFILL`
+  rather than lowering it silently, because a chunk chosen for v2 alone turns every
+  prefill comparison into a chunk-size comparison. Both `-chunk<N>` and `-mr<N>`
+  are in the filename now.
+* **A v2 number is not quotable until its logits match v1's.** Blocker 3 is a real
+  numerics bug on the contiguous path, and a mis-scaled GEMM there still produces
+  fluent text -- compare first-token top-5 logprobs against the `deepep` arm on the
+  stock image before reading any throughput row. `patches/README.md` has the
+  arithmetic.
 * **`DP_ATTN` is offered by the cookbook but is not a verified cell**, and
   `server_args`' own help for `--enable-dp-attention` says the DP size "should be
   equal to the tp size" while the cookbook offers 4 with TP 8. Treat any DP-attn
   number as exploratory, and note that on an MLA model it changes the KV pool
   shape, i.e. it is an axis, not a tweak.
 * Every one of these axes is in the **filename** (`TOPO` gains
-  `-a2a<backend>-ep<n>-dp<n>`) and in the log header (`### moe_a2a=... ep=...`),
+  `-a2a<backend>[cap<n>]-chunk<n>-mr<n>-ep<n>-dp<n>`) and in the log header
+  (`### moe_a2a=... ep=... v2_cap=... chunk=...`),
   and `gen_bench_table.py` prints an `moe` column. A row from before these knobs
   existed shows `-`, which means pure TP -- it does not mean unknown.
 
@@ -234,6 +254,8 @@ _pd_launch.sh             shared PD host launcher (not an entry point)
 22_launch_router.sh       sglang_router in front of the pair
 start_server.sh           IN-CONTAINER: serves all three arms (PD_ROLE switches)
 Dockerfile                hy4-preview-efa:latest -- EFA + Mooncake, PD only
+Dockerfile.deepep_v2      hy4-preview-v2:latest  -- 3 source patches, nothing else
+patches/                  the deepep_v2 diffs + per-blocker root cause (README.md)
 90_smoke_test.sh          health / reasoning / no_think / streaming
 95_features_test.py       asserting harness: 12 functional checks
 91_bench.sh               one bench_serving point -> results/<TAG>.log
