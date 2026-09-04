@@ -1,9 +1,15 @@
 #!/bin/bash
 # HOST-side launcher: start the single-node Hy4-preview container on one B300.
 #
-#   bash 10_launch_standalone.sh                          # MXFP8 TP4, MTP on
-#   PROFILE=high-throughput bash 10_launch_standalone.sh  # MXFP8 TP4, MTP off
+#   bash 10_launch_standalone.sh                          # MXFP8 TP8, MTP on
+#   PROFILE=high-throughput bash 10_launch_standalone.sh  # MXFP8 TP8, MTP off
 #   QUANT=bf16 bash 10_launch_standalone.sh               # BF16 TP8, MTP on
+#   TP_SIZE=4 bash 10_launch_standalone.sh                # the old TP4 cell, half a node
+#
+# MoE parallelism (both arms are TP8, so EP=8 is the whole node):
+#   EP_SIZE=8 bash 10_launch_standalone.sh                # EP, no all-to-all library
+#   A2A_BACKEND=deepep bash 10_launch_standalone.sh       # DeepEP; forces EP = TP
+#   DP_ATTN=8 EP_SIZE=8 bash 10_launch_standalone.sh      # + attention DP
 #
 # Cross-node (TP16 BF16 over EFA -- not a cookbook-verified cell): same command
 # on both hosts but NODE_RANK, and DIST_INIT_ADDR is rank 0's IP on both. Only
@@ -20,11 +26,16 @@ source ./env_common.sh
 NAME="${NAME:-hy4-preview}"
 build_cache_args
 require_weights
+# Resolves EP_EFF / MOE_ARGS / MOE_TAG and refuses an impossible A2A_BACKEND
+# before the ~10 min weight load. The container recomputes the same values from
+# the same env vars, so this is a fail-fast gate, not a second source of truth.
+build_moe_args
+[[ "$A2A_BACKEND" == "deepep" ]] && require_deepep_image "$IMAGE"
 
-# TP4 uses half the node, so pin the ranks instead of exposing all 8 GPUs: it
-# leaves 4-7 genuinely free (a second instance, or a K3 arm) and it makes the
-# device set part of the container's config rather than an accident of which
-# GPUs sglang happened to enumerate.
+# Pin the ranks rather than exposing all 8 GPUs even at TP8: the device set then
+# belongs to the container's config instead of being an accident of which GPUs
+# sglang happened to enumerate, and at TP_SIZE=4 it leaves GPUs 4-7 genuinely
+# free for a second instance.
 GPUS_PER_NODE=$(( TP_SIZE / NNODES ))
 if [[ -z "${GPU_LIST:-}" ]]; then
     GPU_LIST=$(seq -s, 0 $(( GPUS_PER_NODE - 1 )))
@@ -58,9 +69,14 @@ docker run -d --name "$NAME" \
     -e QUANT="$QUANT" \
     -e PROFILE="$PROFILE" \
     -e SPEC="$SPEC" \
-    -e TOPO="${TOPO:-tp${TP_SIZE}x${NNODES}node}" \
+    -e TOPO="${TOPO:-tp${TP_SIZE}x${NNODES}node${MOE_TAG}}" \
     -e BENCH_GPUS="${BENCH_GPUS:-$TP_SIZE}" \
     -e TP_SIZE="$TP_SIZE" \
+    -e A2A_BACKEND="$A2A_BACKEND" \
+    -e EP_SIZE="${EP_SIZE:-}" \
+    -e DEEPEP_MODE="$DEEPEP_MODE" \
+    -e DP_ATTN="${DP_ATTN:-}" \
+    -e ALLOW_UNVALIDATED_A2A="${ALLOW_UNVALIDATED_A2A:-0}" \
     -e MODEL_PATH="$MODEL_PATH" \
     -e SERVED_MODEL_NAME="$SERVED_MODEL_NAME" \
     -e CONTEXT_LEN="${CONTEXT_LEN:-}" \
@@ -79,6 +95,8 @@ docker run -d --name "$NAME" \
     /host/hy4-preview-sglang/start_server.sh
 
 echo "launched '$NAME': quant=$QUANT tp=$TP_SIZE gpus=$GPU_LIST profile=$PROFILE spec=$SPEC image=$IMAGE"
+echo "  moe   : a2a=$A2A_BACKEND ep=$EP_EFF moe_tp=$(( TP_SIZE / EP_EFF )) dp_attn=${DP_ATTN:-off}"
+echo "  topo  : ${TOPO:-tp${TP_SIZE}x${NNODES}node${MOE_TAG}}"
 if (( NNODES > 1 )); then
     echo "  tp=$TP_SIZE over $NNODES nodes, this host is node-rank $NODE_RANK, rendezvous ${DIST_INIT_ADDR}:${DIST_INIT_PORT}"
     echo "  (rank != 0 never binds :$PORT -- do not wait for 'server is fired up' there)"

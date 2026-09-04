@@ -14,12 +14,18 @@
 #   --quantization       : read from config.json quantization_config (MXFP8)
 #   --attention-backend  : DSA (flashmla_sparse + FP8 indexer cache) is auto-picked
 #   --enable-*-cp / --pp : HYV4ForCausalLM rejects both before allocation
+#
+# MoE parallelism (--ep-size / --moe-a2a-backend / --deepep-mode / DP attention)
+# is NOT spelled out here either -- it comes from build_moe_args() in
+# env_common.sh, which resolves EP the same way sglang does and refuses the
+# backends that cannot run this architecture.
 set -euo pipefail
 
 source /host/hy4-preview-sglang/env_common.sh
 setup_runtime_env
 build_multinode_args
 build_pd_args
+build_moe_args
 
 # ---- MTP (NextN) speculative decoding ----
 # One draft layer (model.mtp_layers.0, ~10B params) ships in BOTH checkpoints, so
@@ -68,6 +74,12 @@ RADIX_ARGS=();  [[ "${DISABLE_RADIX:-0}" == "1" ]] && RADIX_ARGS=(--disable-radi
 echo "=== Hy4-preview: quant=${QUANT} tp=${TP_SIZE} nodes=${NNODES}/rank${NODE_RANK}" \
      "profile=${PROFILE} spec=${SPEC} ctx=${CONTEXT_LEN:-default}" \
      "pd=${PD_ROLE:-off}${PD_ROLE:+/${TRANSFER_BACKEND:-mooncake}} ==="
+# EP/a2a are echoed as what WILL run, not as what was requested: EP_EFF is the
+# post-resolution degree (a2a-spanning backends force EP = TP upstream, and this
+# kit resolves it the same way so the two never diverge).
+echo "    moe: a2a=${A2A_BACKEND} ep=${EP_EFF} moe_tp=$(( TP_SIZE / EP_EFF ))" \
+     "deepep_mode=$([[ $A2A_BACKEND == deepep ]] && echo "$DEEPEP_MODE" || echo n/a)" \
+     "dp_attn=${DP_ATTN:-off} -> ${MOE_ARGS[*]:-<none, pure TP>}"
 if [[ -n "${PD_ROLE:-}" ]]; then
     echo "    MOONCAKE_PROTOCOL=${MOONCAKE_PROTOCOL:-} MC_MAX_CONCURRENT_REG_MR=${MC_MAX_CONCURRENT_REG_MR:-}" \
          "PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-}" \
@@ -86,6 +98,7 @@ exec sglang serve \
     --served-model-name "$SERVED_MODEL_NAME" \
     --tp-size "$TP_SIZE" \
     "${GEMM_ARGS[@]}" \
+    ${MOE_ARGS[@]+"${MOE_ARGS[@]}"} \
     --reasoning-parser auto \
     --tool-call-parser auto \
     "${SPEC_ARGS[@]}" \

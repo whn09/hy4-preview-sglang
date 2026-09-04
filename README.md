@@ -5,8 +5,15 @@ Test kit for **Tencent Hy4-preview** (HYV4) on 8x B300 nodes, modelled on the
 
 | arm | hosts | image | status |
 |---|---|---|---|
-| single node, MXFP8 TP4 | B300-3 | stock `lmsysorg/sglang:hy4-preview` | **measured** (7 points), see below |
+| single node, MXFP8 **TP8** (default) | any one B300 | stock `lmsysorg/sglang:hy4-preview` | **not yet measured** |
+| single node, MXFP8 TP4 (`TP_SIZE=4`) | B300-3 | stock `lmsysorg/sglang:hy4-preview` | **measured** (7 points), see below |
 | 1P1D PD disaggregation | B300-1 prefill / B300-2 decode | `hy4-preview-efa:latest` (ECR, see below) | **boots healthy; not yet benchmarked** |
+| EP / DeepEP arms (`EP_SIZE`, `A2A_BACKEND`) | any one B300 | either | **wired and gated; not yet measured** |
+
+**The default TP changed from 4 to 8** for both quantizations. See "TP8, and why it
+is not a guess" below; the seven measured rows further down are the **TP4**
+campaign and are labelled as such -- TP is in every filename, so the two arms
+cannot collide.
 
 The 1P1D pair reached `HTTP 200 /health` on both sides simultaneously on
 2026-09-04 at 18:59 KST -- so the EFA image, the Mooncake swap, the bootstrap port
@@ -70,10 +77,147 @@ OpenAI tier -- it has to go through `chat_template_kwargs` / `extra_body`.
 
 ### Cookbook cells that apply to this hardware
 
-Verified: **MXFP8 TP4 single node** and **BF16 TP8 single node** (B300, 288 GB).
-H200/B200/GB300 BF16 are 2-node TP16/TP8 cells and still marked in-progress
-upstream. `QUANT=mxfp8|bf16` in `env_common.sh` picks the weights *and* the TP
-size together, because on this hardware they are one decision.
+Verified for B300 (288 GB): **MXFP8 TP4 single node** and **BF16 TP8 single
+node**. H200/B200/GB300 BF16 are 2-node TP16/TP8 cells and still marked
+in-progress upstream.
+
+---
+
+## TP8, and why it is not a guess
+
+Both arms now default to `TP_SIZE=8`, the whole node. The b300 cell the cookbook
+marks verified for MXFP8 is TP**4**, so this needs saying plainly: TP8 MXFP8 on
+b300 is **not a verified cell**, it is the intersection of two verified cells.
+
+* The **b200 MXFP8** verified cell is `--tp 8 --moe-runner-backend deep_gemm
+  --fp8-gemm-backend deep_gemm` -- the exact flag set this kit emits, on a
+  smaller GPU (192 GB). So MXFP8-at-TP8 is exercised upstream.
+* The **b300 BF16** verified cell is `--tp 8`. So TP8-on-b300 is exercised
+  upstream.
+* The cookbook's TP knob **does not disable** TP8 for b300; the only disables on
+  the value 8 are `h200/b200 + bf16` (~190 GB/rank does not fit) and
+  `gb300 + single` (4-GPU hosts).
+* 64 attention heads / 8 = 8 per rank, 32 DSA index heads / 8 = 4 per rank,
+  `moe_intermediate_size` 2048 / 8 = 256 -- nothing is indivisible at 8.
+
+What it buys: per-rank weights halve to **~95 GB**, so roughly twice as much of
+the 288 GB is left for the KV pool and the MoE gets 8 ranks of compute instead of
+4. What it costs: one more all-reduce hop per layer, and one instance now occupies
+the whole node -- the TP4 arm deliberately left GPUs 4-7 free. `TP_SIZE=4` still
+reproduces the old arm exactly.
+
+Note that TP4 and TP8 are **not** a like-for-like per-GPU comparison of the same
+service: they have different KV pools and therefore different admission
+behaviour. Compare them on `out tok/s/GPU` *and* on latency at matched
+concurrency, and expect the TP8 arm to win where the TP4 arm was pool-limited.
+
+---
+
+## MoE parallelism: EP and the a2a backends
+
+Short answers: **EP=8 works and is one env var**, `deepep` is the only
+all-to-all backend the cookbook offers for this model, and `deepep_v2` is
+**hard-blocked** by an architecture whitelist upstream.
+
+```bash
+EP_SIZE=8 bash 10_launch_standalone.sh                 # EP, no a2a library
+A2A_BACKEND=deepep bash 10_launch_standalone.sh        # DeepEP (forces EP = TP)
+DEEPEP_MODE=low_latency A2A_BACKEND=deepep bash 10_launch_standalone.sh
+DP_ATTN=8 EP_SIZE=8 bash 10_launch_standalone.sh       # + attention DP
+```
+
+### EP=8 is arithmetically free on this model
+
+256 routed experts + 1 shared, top-8 sigmoid routing, **`n_group` 1 /
+`topk_group` 1** (so there is no expert-group constraint to satisfy),
+`moe_intermediate_size` 2048. 256/8 = 32 experts per rank; `moe_tp_size` =
+TP/EP/moe_dp = 1, so each rank holds its 32 experts whole. `build_moe_args()`
+re-checks all three divisibilities and names the constant that failed.
+
+### Two different things are both called "EP"
+
+* **`EP_SIZE=8` with `A2A_BACKEND=none`** is still real expert parallelism. It
+  runs through `StandardDispatcher`, which builds a `local_expert_mapping` and
+  masks: every rank sees every token, computes only its own 32 experts, and the
+  existing post-MoE all-reduce does the combine. **No dispatch/combine
+  collective, no DeepEP, nothing extra in the image** -- it works on any
+  interconnect. On one node over NVLink that is cheap. What it never does is
+  shrink activation traffic, which is why it is not the cross-node answer.
+* **`A2A_BACKEND=deepep`** replaces that with a real all-to-all: each rank sends
+  only the tokens its experts were selected for. This is the cookbook's own
+  option, labelled there `"DeepEP (EP = TP)"`.
+
+### EP is silently rewritten for every a2a-spanning backend
+
+From `arg_groups/overrides.py`:
+
+```python
+@register_post_process
+def _a2a_ep_size(view):
+    if view.moe_a2a_backend in _A2A_EP_SPANNING_BACKENDS:   # deepep, deepep_v2,
+        ...                                                 # mooncake, nixl,
+        return {"ep_size": view.tp_size}                    # flashinfer, mori,
+                                                            # pplx, megamoe, ...
+```
+
+So `--ep-size 4 --moe-a2a-backend deepep` at TP8 **runs EP=8** and only says so
+in an `logger.info`. This kit therefore resolves EP itself and passes the
+resolved number, so the flag, the startup line and the results filename can
+never disagree -- and it *refuses* an `EP_SIZE` that a2a would overwrite instead
+of quietly honouring the other value.
+
+### Every a2a backend, and what happens if you ask for it
+
+`MoeA2ABackend` (`layers/moe/utils.py`) has twelve members. What each one means
+for **this** model:
+
+| `A2A_BACKEND` | this kit | why |
+|---|---|---|
+| `none` (default) | runs | the verified cell: pure TP MoE, or masked EP when `EP_SIZE>1` |
+| `deepep` | runs | the cookbook's own experimentation override, `EP = TP` |
+| `deepep_v2` | **refused** | `validate_deepep_v2_model_architecture()` whitelists exactly `DeepseekV3ForCausalLM`, `DeepseekV4ForCausalLM`, `Qwen3MoeForCausalLM`; Hy4 is `HYV4ForCausalLM`, so it raises before allocation ("other model workflows may require an all-reduce after A2A combine") |
+| `megamoe` | **refused** | the cookbook omits it: its fused path is not wired for Hy4's sigmoid-scored, bounded-SwiGLU experts |
+| `mori` | **refused** | ROCm |
+| `ascend_fuseep`, `ascend_tp` | **refused** | Ascend NPU |
+| `mooncake`, `nixl`, `flashinfer`, `pplx`, `customized` | `ALLOW_UNVALIDATED_A2A=1` | real code paths, EP-spanning, but not exercised on Hy4 |
+
+**`mooncake`/`nixl` in that list are the MoE expert all-to-all transport, not the
+PD KV transport.** The PD one is `TRANSFER_BACKEND`, a completely unrelated flag
+that happens to take the same two words. The gate says so in its error message,
+because a typo between them would otherwise "work".
+
+### Things to know before reading an EP number
+
+* **DeepEP has to be in the image.** The stock `lmsysorg/sglang:hy4-preview` is
+  built for pure-TP recipes and is not required to ship `deep_ep`;
+  `require_deepep_image()` checks `find_spec("deep_ep")` on the host *before* the
+  ~10 min weight load, so the failure costs a second instead of ten minutes. This
+  is unverified either way on the current image -- the check exists precisely
+  because we have not been able to look.
+* **`DEEPEP_MODE=normal` disables CUDA graphs for both phases**
+  (`moe_hook.py`: "Cuda graph is disabled because deepep_mode=`normal`"). Any
+  latency comparison against another arm then also carries graph-on/graph-off,
+  which was worth 3.27x on K3. `auto` (the default) is normal-for-prefill,
+  low-latency-for-decode.
+* **MXFP8 + DeepEP-LL is handled but mixes granularities.** DeepEP's low-latency
+  dispatch quantises activations at a fixed 128 block while the checkpoint's
+  weight block is `[1, 32]`; the deep_gemm runner has an explicit
+  `running_state["mxfp8_act_gran_k"] = 128` for exactly this combination, so it
+  is anticipated upstream rather than accidental. It is still not a cell anybody
+  has published numbers for.
+* **Hy4's bounded SwiGLU already forces the compact DeepGEMM layout.**
+  `_masked_activation_unsupported_reason()` requires group 128, MXFP8 is group 32,
+  so the masked standard layout is off and the log says so. That is pre-existing
+  at TP4/EP1, not something EP introduces -- do not read it as an EP failure.
+* **`DP_ATTN` is offered by the cookbook but is not a verified cell**, and
+  `server_args`' own help for `--enable-dp-attention` says the DP size "should be
+  equal to the tp size" while the cookbook offers 4 with TP 8. Treat any DP-attn
+  number as exploratory, and note that on an MLA model it changes the KV pool
+  shape, i.e. it is an axis, not a tweak.
+* Every one of these axes is in the **filename** (`TOPO` gains
+  `-a2a<backend>-ep<n>-dp<n>`) and in the log header (`### moe_a2a=... ep=...`),
+  and `gen_bench_table.py` prints an `moe` column. A row from before these knobs
+  existed shows `-`, which means pure TP -- it does not mean unknown.
 
 ---
 
@@ -108,8 +252,9 @@ three flags, and the K3 pair has already drifted.
 
 ```bash
 bash 00_download_models.sh mxfp8          # 758 G, ~4 min at ~3 GB/s
-bash 10_launch_standalone.sh              # MXFP8 TP4, MTP on
+bash 10_launch_standalone.sh              # MXFP8 TP8, MTP on
 PROFILE=high-throughput bash 10_launch_standalone.sh   # MTP off
+TP_SIZE=4 bash 10_launch_standalone.sh    # the TP4 arm the table below measured
 docker logs -f hy4-preview
 bash 90_smoke_test.sh
 CONCS="1 16 64 256" bash 92_sweep.sh
@@ -120,8 +265,11 @@ deep_gemm JIT plus CUDA-graph capture. The JIT stall reads exactly like a hang -
 it is not. The caches in `CACHE_MOUNTS` are what stops the next launch paying it
 again.
 
-KV pool, TP4 MXFP8 on B300: **520,512 tokens / 44.91 GB + 0.62 GB indexer per
-rank** with MTP on, **566,464 tokens / 48.87 GB** with MTP off.
+KV pool, **TP4** MXFP8 on B300: **520,512 tokens / 44.91 GB + 0.62 GB indexer per
+rank** with MTP on, **566,464 tokens / 48.87 GB** with MTP off. At TP8 the weights
+drop to ~95 GB/rank so there is far more room, but the pool is sized from
+`mem_fraction_static` against what is left after the weights and the graphs --
+read the number out of the startup log rather than scaling these two by hand.
 
 `--tp-size`, not the cookbook's `--tp`: this build has **no `--tp` option at
 all**. The cookbook's command works only through argparse prefix matching, which
@@ -143,9 +291,13 @@ docker run --rm --net=host -v $PWD:/w -w /w \
   --entrypoint python3 lmsysorg/sglang:hy4-preview 95_features_test.py
 ```
 
-### Measured: MXFP8 TP4, 1024 in / 1024 out, B300
+### Measured: MXFP8 **TP4**, 1024 in / 1024 out, B300
 
-Generated by `gen_bench_table.py`, not transcribed.
+Generated by `gen_bench_table.py`, not transcribed. This is the **TP4** campaign
+of 2026-09-04 -- the kit's default is now TP8, so reproduce it with
+`TP_SIZE=4`. These logs also predate the `topo`/`gpus`/`moe` headers, so the
+generator marks them `*` and prints `moe` as `-` (they were pure TP: the EP knobs
+did not exist yet).
 
 | profile | spec (MTP) | conc | reqs | dur (s) | TTFT p50 (ms) | TPOT p50 (ms) | ITL p50 (ms) | out tok/s | out tok/s/GPU |
 |---|---|---|---|---|---|---|---|---|---|
@@ -196,10 +348,14 @@ bash 22_launch_router.sh
 ENDPOINT=localhost:8000 SRV=hy4-prefill bash 91_bench.sh
 ```
 
-TP4 per side, MXFP8, GPUs 0-3 on each host. `TRANSFER_BACKEND` and `SPEC` must
-**match on both sides**: they are not negotiated at handshake time, and a
-mismatch shows up as a stalled request or a blacklisted Mooncake session rather
-than as a startup error.
+**TP8 per side** now, MXFP8, GPUs 0-7 on each host -- so the pair occupies two
+whole nodes and `BENCH_GPUS` is 16, which is the `out tok/s/GPU` denominator.
+`TP_SIZE=4` on both sides reproduces the half-node pair the 18:59 KST boot used.
+
+`TP_SIZE`, `TRANSFER_BACKEND`, `SPEC` and the MoE geometry (`A2A_BACKEND` /
+`EP_SIZE` / `DP_ATTN`) must **match on both sides**: none of them is negotiated at
+handshake time, and a mismatch shows up as a stalled request or a blacklisted
+Mooncake session rather than as a startup error.
 
 ### Why PD needs its own image
 
@@ -235,8 +391,8 @@ pip NCCL 2.31.2, and `mooncake-transfer-engine-efa-cuda13`.
 **One stated confound:** that NCCL upgrade makes the PD image's intra-node TP
 all-reduce a *different NCCL* from the stock image the single-node arm runs, so a
 PD-vs-single-node comparison carries an NCCL version as a second axis. Nothing in
-1P1D needs >= 2.31 (each side is single-node TP4, so NCCL never leaves the node);
-it is carried over so the image stays usable for a future cross-node arm. To
+1P1D needs >= 2.31 (each side is a single-node TP server, so NCCL never leaves the
+node); it is carried over so the image stays usable for a future cross-node arm. To
 remove the axis: `docker build --build-arg NCCL_PIP_VER= ...` and say so in the
 results header.
 
@@ -329,6 +485,16 @@ set explicitly -- and if you set it, put it in the results tag.
 
 ## Known gaps
 
+* **No TP8 numbers at all.** The default changed to TP8 on 2026-09-05 on the
+  source-level grounds above; every measured row in this file is TP4. The first
+  thing to run on the next node is the same 1/16/64/256 ladder at TP8, both
+  profiles, so the TP4 rows get a partner.
+* **No EP or DeepEP numbers.** The knobs are wired and gated but nothing has run.
+  Two unknowns are worth settling in the first ten minutes: whether the stock
+  image even contains `deep_ep` (`require_deepep_image()` answers that in one
+  second), and whether `EP_SIZE=8 A2A_BACKEND=none` at TP8 is faster or slower
+  than pure TP -- on one node with NVLink it is not obvious in either direction,
+  because masked EP trades MoE FLOPs per rank for zero extra communication.
 * **MTP-on c=256** single-node row. Started at 18:58 KST and was killed ~2 min in
   by the cluster shutdown; `results/` therefore contains a header-only log for it,
   which `gen_bench_table.py` reports under "NO rc IN HEADER" rather than treating

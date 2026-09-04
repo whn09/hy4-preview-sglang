@@ -1,13 +1,14 @@
 #!/bin/bash
 # HOST-side launcher: the DECODE side of a 1P1D pair. Run on B300-2.
 #
-#   bash 21_launch_decode.sh                             # MXFP8 TP4, MTP on, mooncake
+#   bash 21_launch_decode.sh                             # MXFP8 TP8, MTP on, mooncake
 #   PROFILE=high-throughput bash 21_launch_decode.sh     # MTP off
 #   TRANSFER_BACKEND=nixl bash 21_launch_decode.sh       # must MATCH the prefill side
 #
-# TRANSFER_BACKEND and SPEC must be the same on both sides. They are not
-# negotiated at handshake time: a mismatch shows up as a stalled request or a
-# blacklisted mooncake session, not as a startup error.
+# TP_SIZE, SPEC, TRANSFER_BACKEND and the MoE geometry (A2A_BACKEND / EP_SIZE /
+# DP_ATTN) must be the same on both sides. None of them is negotiated at
+# handshake time: a mismatch shows up as a stalled request or a blacklisted
+# mooncake session, not as a startup error.
 #
 # Note on admission: with MTP on, SGLang resets max_running_requests to 48 unless
 # it is set explicitly (the same trap as K3/DSPARK). On the decode side that IS

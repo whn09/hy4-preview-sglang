@@ -12,7 +12,7 @@ rc != 0 are dropped with a note rather than silently averaged in.
 
 Both a time column and a rate column are printed on purpose: tok/s alone has
 inverted a conclusion before, because its denominator (GPU count) changes between
-a TP4 MXFP8 arm and a TP8 BF16 arm.
+a TP4 arm, a TP8 arm and a 1P1D pair (which occupies 2x TP).
 """
 import pathlib
 import re
@@ -25,6 +25,11 @@ HDR = [
     ("topo",    r"^### .*\btopo=(\S+)"),
     ("gpus",    r"^### .*\bgpus=(\S+)"),
     ("backend", r"^### .*\bbackend=(\S+)"),
+    # MoE geometry. Absent from any log written before the EP/a2a knobs existed;
+    # such a row WAS pure TP (the flags could not be passed), but it says so by
+    # having no header line, not by asserting it, so it prints as "-".
+    ("a2a",     r"^### .*\bmoe_a2a=(\S+)"),
+    ("ep",      r"^### .*\bmoe_a2a=\S+ ep=(\S+)"),
     ("profile", r"^### .*\bprofile=(\S+)"),
     ("spec",    r"^### .*\bspec=(\S+)"),
     ("isl",     r"^### .*\bisl=(\S+)"),
@@ -94,8 +99,8 @@ def main():
         return (r["quant"], r["topo"], num(r["tp"]), r["profile"],
                 num(r["isl"]), num(r["osl"]), num(r["conc"]))
 
-    print("| quant | topo | profile | spec | ISL/OSL | conc | reqs | dur (s) | TTFT p50 (ms) | TPOT p50 (ms) | ITL p50 (ms) | E2E p50 (ms) | out tok/s | GPUs | out tok/s/GPU |")
-    print("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
+    print("| quant | topo | moe | profile | spec | ISL/OSL | conc | reqs | dur (s) | TTFT p50 (ms) | TPOT p50 (ms) | ITL p50 (ms) | E2E p50 (ms) | out tok/s | GPUs | out tok/s/GPU |")
+    print("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
     guessed = False
     for r in sorted(rows, key=key):
         # gpus comes from the RUNNING container (BENCH_GPUS). Falling back to TP is
@@ -111,8 +116,11 @@ def main():
             guessed = True
         per_gpu = r["out_tps"] / gpus if (r["out_tps"] and gpus) else None
         topo = r["topo"] if r["topo"] != "?" else f"tp{r['tp']}x{r['nnodes']}node*"
-        print("| {} | {} | {} | {} | {}/{} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |".format(
-            r["quant"], topo, r["profile"], r["spec"],
+        # "a2a/ep" in one column: EP alone is ambiguous because an a2a-spanning
+        # backend forces EP = TP, so the pair is the only honest label.
+        moe = "-" if r["a2a"] == "?" else "{}/ep{}".format(r["a2a"], r["ep"])
+        print("| {} | {} | {} | {} | {} | {}/{} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |".format(
+            r["quant"], topo, moe, r["profile"], r["spec"],
             r["isl"], r["osl"], r["conc"], cell(r["ok"], "{:.0f}"), cell(r["dur"]),
             cell(r["ttft_p50"]), cell(r["tpot_p50"]), cell(r["itl_p50"]),
             cell(r["e2e_p50"]), cell(r["out_tps"]), gpus or "-", cell(per_gpu)))
@@ -120,7 +128,8 @@ def main():
     print("\n_out tok/s/GPU denominator = the GPUs the whole serving instance "
           "occupies, read from the container's BENCH_GPUS: TP size for a "
           "single-node row, 2x TP for a 1P1D pair. A TP4 MXFP8 row, a TP8 BF16 "
-          "row and a PD row do not share it._")
+          "row and a PD row do not share it. `moe` = a2a backend / EP degree; "
+          "`-` means the log predates the knob, i.e. pure TP MoE._")
     if guessed:
         print("\n_Rows marked `*` predate the topo/gpus header; their GPU count was "
               "assumed = TP, which is WRONG for any disaggregated row. Re-run or "

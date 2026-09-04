@@ -53,6 +53,15 @@ RUN_TOPO="$(read_cenv "$SRV" TOPO "${TOPO:-tp${RUN_TP}x${RUN_NN}node}")"
 # 1P1D pair occupies TP_SIZE GPUs on EACH of two hosts, so TP alone would credit
 # it with double its real per-GPU throughput.
 RUN_GPUS="$(read_cenv "$SRV" BENCH_GPUS "${BENCH_GPUS:-$RUN_TP}")"
+# MoE geometry, for the header. It is already inside RUN_TOPO (build_moe_args
+# appends MOE_TAG to TOPO) so the FILENAME is safe without these; they are here so
+# a log states the EP degree in words instead of leaving it to be decoded from a
+# tag fragment. EP_SIZE is the REQUEST -- read a2a too, because with any
+# a2a-spanning backend the EP that ran is tp_size regardless of what was asked.
+RUN_A2A="$(read_cenv "$SRV" A2A_BACKEND "${A2A_BACKEND:-none}")"
+RUN_EP="$(read_cenv "$SRV" EP_SIZE "${EP_SIZE:-}")"
+[[ "$RUN_A2A" != "none" && "$RUN_A2A" != "unknown" ]] && RUN_EP="$RUN_TP"
+RUN_DPATTN="$(read_cenv "$SRV" DP_ATTN "${DP_ATTN:-}")"
 
 RESULTS_DIR="${RESULTS_DIR:-$SCRIPT_DIR_HOST/results}"
 TAG="${TAG:-${RUN_QUANT}-${RUN_TOPO}-${RUN_PROF}-spec${RUN_SPEC}-isl${ISL}-osl${OSL}-c${CONCURRENCY}-n${NUM_PROMPTS}}"
@@ -68,6 +77,7 @@ echo "log  : ${LOG}"
   echo "### endpoint=${ENDPOINT} image=$(docker inspect -f '{{.Config.Image}}' "$SRV" 2>/dev/null || echo unknown)"
   echo "### quant=${RUN_QUANT} tp=${RUN_TP} nnodes=${RUN_NN} profile=${RUN_PROF} spec=${RUN_SPEC}"
   echo "### topo=${RUN_TOPO} gpus=${RUN_GPUS} backend=$(read_cenv "$SRV" TRANSFER_BACKEND none)"
+  echo "### moe_a2a=${RUN_A2A} ep=${RUN_EP:-1} dp_attn=${RUN_DPATTN:-off}"
   echo "### isl=${ISL} osl=${OSL} num_prompts=${NUM_PROMPTS} concurrency=${CONCURRENCY}"
   echo "### started=$(date -u +%FT%TZ)"
 } > "$LOG"

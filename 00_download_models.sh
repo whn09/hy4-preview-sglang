@@ -2,7 +2,7 @@
 # Download the Hy4-preview weights to local NVMe. Run on the HOST (uses the
 # /opt/pytorch venv), not inside the container.
 #
-#   bash 00_download_models.sh          # MXFP8 (~760GB) -- the B300 TP4 recipe
+#   bash 00_download_models.sh          # MXFP8 (~760GB) -- the B300 recipe (TP8)
 #   bash 00_download_models.sh bf16     # BF16  (~1.5TB) -- the B300 TP8 recipe
 #   bash 00_download_models.sh both
 #

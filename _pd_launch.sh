@@ -22,10 +22,16 @@ IMAGE="$PD_IMAGE"
 build_cache_args
 build_gdr_args
 require_weights
+# EP/a2a resolution + fail-fast. The two sides of a pair must match on this as
+# well as on TRANSFER_BACKEND and SPEC: the MoE geometry is per-server, but a
+# prefill and a decode with different expert layouts produce KV the other side
+# cannot verify against, and nothing negotiates it at handshake time.
+build_moe_args
+[[ "$A2A_BACKEND" == "deepep" ]] && require_deepep_image "$IMAGE"
 
-# TP4 per side, so pin the ranks rather than exposing all 8 GPUs: GPUs 4-7 stay
-# genuinely free, and the device set becomes part of the container's config
-# instead of an accident of enumeration order.
+# Pin the ranks rather than exposing all 8 GPUs: the device set becomes part of
+# the container's config instead of an accident of enumeration order, and at
+# TP_SIZE=4 GPUs 4-7 stay genuinely free.
 GPUS_PER_NODE=$(( TP_SIZE / NNODES ))
 if [[ -z "${GPU_LIST:-}" ]]; then
     GPU_LIST=$(seq -s, 0 $(( GPUS_PER_NODE - 1 )))
@@ -49,7 +55,7 @@ fi
 # 91_bench.sh. BENCH_GPUS is the tok/s/GPU denominator and it is NOT $TP_SIZE
 # here: a 1P1D pair occupies TP_SIZE GPUs on each of two hosts. Getting this
 # wrong is how a PD arm gets credited with double its real per-GPU throughput.
-TOPO="${TOPO:-pd1p1d-tp${TP_SIZE}-${TRANSFER_BACKEND:-mooncake}}"
+TOPO="${TOPO:-pd1p1d-tp${TP_SIZE}-${TRANSFER_BACKEND:-mooncake}${MOE_TAG}}"
 BENCH_GPUS="${BENCH_GPUS:-$(( TP_SIZE * 2 ))}"
 
 docker run -d --name "$NAME" \
@@ -76,6 +82,11 @@ docker run -d --name "$NAME" \
     -e TOPO="$TOPO" \
     -e BENCH_GPUS="$BENCH_GPUS" \
     -e TP_SIZE="$TP_SIZE" \
+    -e A2A_BACKEND="$A2A_BACKEND" \
+    -e EP_SIZE="${EP_SIZE:-}" \
+    -e DEEPEP_MODE="$DEEPEP_MODE" \
+    -e DP_ATTN="${DP_ATTN:-}" \
+    -e ALLOW_UNVALIDATED_A2A="${ALLOW_UNVALIDATED_A2A:-0}" \
     -e MODEL_PATH="$MODEL_PATH" \
     -e SERVED_MODEL_NAME="$SERVED_MODEL_NAME" \
     -e CONTEXT_LEN="${CONTEXT_LEN:-}" \
@@ -95,6 +106,7 @@ docker run -d --name "$NAME" \
 
 echo "launched '$NAME': role=$PD_ROLE backend=${TRANSFER_BACKEND:-mooncake} quant=$QUANT tp=$TP_SIZE gpus=$GPU_LIST spec=$SPEC"
 echo "  image : $IMAGE"
+echo "  moe   : a2a=$A2A_BACKEND ep=$EP_EFF moe_tp=$(( TP_SIZE / EP_EFF )) dp_attn=${DP_ATTN:-off}"
 echo "  topo  : $TOPO   (tok/s/GPU denominator = $BENCH_GPUS)"
 echo "  http  : 0.0.0.0:${PORT}   bootstrap: ${BOOTSTRAP_PORT}"
 echo "  logs  : docker logs -f $NAME"

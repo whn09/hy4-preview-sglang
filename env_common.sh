@@ -23,10 +23,24 @@ SCRIPT_DIR_HOST="${SCRIPT_DIR_HOST:-/home/ubuntu/hy4-preview-sglang}"
 # re-pull would silently change what a results/ log refers to.
 IMAGE="${IMAGE:-lmsysorg/sglang:hy4-preview}"
 
-# ---- quantization picks the topology, not just the weights ----
-# 770B total / 49B active. MXFP8 ~760GB -> ~190GB/rank at TP4; BF16 ~1.5TB ->
-# ~190GB/rank at TP8. Both fit a B300 (288GB) node; on 141/192GB parts the BF16
-# arm is a 2-node TP16 recipe instead (not our hardware).
+# ---- quantization picks the weights; TP is 8 for both ----
+# 770B total / 49B active. MXFP8 ~760GB, BF16 ~1.5TB, so per rank: MXFP8 ~95GB at
+# TP8 (~190GB at TP4), BF16 ~190GB at TP8. All three fit a B300 (288GB) node; on
+# 141/192GB parts the BF16 arm is a 2-node TP16 recipe instead (not our hardware).
+#
+# BOTH arms default to TP8 -- the whole node -- and that is a change from this
+# kit's first campaign, which ran MXFP8 at TP4 because that is the cell the
+# cookbook marks verified for b300. TP8 MXFP8 is not an invention: it is the
+# *b200* verified cell's flag set (`--tp 8 --moe-runner-backend deep_gemm
+# --fp8-gemm-backend deep_gemm`) run on a larger GPU, and b300's own BF16
+# verified cell is TP8, so the TP8 sharding path and the MXFP8 kernel path are
+# each exercised upstream -- just not in the same cell. The cookbook's TP knob
+# does not disable TP8 for b300+mxfp8 (only h200/b200+bf16 and gb300-single are
+# disabled). What TP8 buys is per-rank weights halved, ~95GB/rank, i.e. roughly
+# twice the memory left for KV; what it costs is one more all-reduce hop per
+# layer and the whole node per instance. TP=4 is still one env var away
+# (`TP_SIZE=4`) and the TP4 rows already in results/ stay comparable because TP
+# is in every filename.
 #
 # MXFP8 needs SM100+, and it self-describes, so there is deliberately no
 # --quantization flag anywhere in this kit -- passing one would override the
@@ -51,7 +65,7 @@ case "$QUANT" in
     mxfp8)
         MODEL_REPO="tencent/Hy4-preview-FP8"
         MODEL_DIRNAME="Hy4-preview-FP8"
-        DEFAULT_TP=4
+        DEFAULT_TP=8
         ;;
     bf16)
         MODEL_REPO="tencent/Hy4-preview"
@@ -68,6 +82,43 @@ MODEL_PATH="${MODEL_PATH:-/models/$MODEL_DIRNAME}"
 # the OpenAI clients in the cookbook address the model by that name, and
 # bench_serving's --model is matched against this string.
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-$MODEL_REPO}"
+
+# ---- MoE parallelism: expert parallelism and the all-to-all backend ----
+# The shape, from tencent/Hy4-preview-FP8 config.json: 256 routed experts + 1
+# shared, top-8 sigmoid routing, n_group 1 / topk_group 1, moe_intermediate_size
+# 2048. 256 divides by 1/2/4/8 and n_group=1 means there is no expert-group
+# constraint to satisfy, so EP=8 is arithmetically clean at TP8.
+#
+# A2A_BACKEND=none is the verified cell (pure TP MoE). It is NOT the same thing as
+# "EP off": with A2A_BACKEND=none and EP_SIZE>1 SGLang still does expert
+# parallelism, via StandardDispatcher's local_expert_mapping -- every rank sees
+# every token, computes only its own 256/EP experts, and the existing post-MoE
+# all-reduce does the combine. There is no dispatch/combine collective and no
+# DeepEP, so it works on any interconnect. Cheap on one node over NVLink; the
+# reason it does not scale cross-node is that it never shrinks the activation
+# traffic.
+#
+# EP_SIZE is only honoured when A2A_BACKEND=none. Every a2a-spanning backend
+# OVERWRITES it with tp_size -- source, arg_groups/overrides.py:
+#   @register_post_process
+#   def _a2a_ep_size(view):
+#       if view.moe_a2a_backend in _A2A_EP_SPANNING_BACKENDS:  # deepep, deepep_v2,
+#           ...                                               # mooncake, nixl,
+#           return {"ep_size": view.tp_size}                   # flashinfer, mori,
+#                                                              # pplx, megamoe, ...
+# so `--ep-size 4 --moe-a2a-backend deepep` at TP8 silently runs EP=8. This kit
+# resolves EP itself and passes the resolved value, so the flag, the log line and
+# the results filename can never disagree.
+A2A_BACKEND="${A2A_BACKEND:-none}"
+EP_SIZE="${EP_SIZE:-}"            # empty => 1 (pure TP MoE), the verified cell
+DEEPEP_MODE="${DEEPEP_MODE:-auto}"  # auto | normal | low_latency
+# Attention DP, the other knob the cookbook exposes for Hy4 (values off/4/8/16,
+# TP must be divisible by it). Off by default: it is offered upstream but is not
+# part of any verified cell, and on an MLA model it changes the KV pool shape, so
+# it is an axis of its own -- hence it is in the results tag below.
+DP_ATTN="${DP_ATTN:-}"            # empty/off => no DP attention
+N_ROUTED_EXPERTS=256              # config.json n_routed_experts
+MOE_INTERMEDIATE=2048             # config.json moe_intermediate_size
 
 # ---- serving profile ----
 # The cookbook's two operating points differ ONLY in whether the built-in MTP
@@ -255,6 +306,155 @@ build_pd_args() {
     # flag's help text is written for mlx5_* names.
     [[ -n "${IB_DEVICE:-}" ]] && PD_ARGS+=(--disaggregation-ib-device "$IB_DEVICE")
     return 0
+}
+
+# Fills MOE_ARGS, and sets EP_EFF (the EP degree that will actually run) and
+# MOE_TAG (the filename fragment). Pure bash, no docker, so the host launcher and
+# the in-container start script compute the SAME answer from the same inputs.
+#
+# Every refusal below is a documented upstream failure, not caution: the point is
+# that a wrong A2A_BACKEND should cost one second, not one weight load.
+build_moe_args() {
+    MOE_ARGS=()
+    MOE_TAG=""
+
+    case "$A2A_BACKEND" in
+        none)
+            EP_EFF="${EP_SIZE:-1}"
+            ;;
+        deepep)
+            # The cookbook's own experimentation override:
+            #   { id: "deepep", label: "DeepEP (EP = TP)",
+            #     flags: ["--moe-a2a-backend deepep"] }
+            # EP is forced to TP by _a2a_ep_size, so an EP_SIZE that disagrees is
+            # a lie about what ran -- refuse it instead of silently rewriting.
+            if [[ -n "$EP_SIZE" && "$EP_SIZE" != "$TP_SIZE" ]]; then
+                echo "ERROR: A2A_BACKEND=deepep forces EP = TP (= $TP_SIZE); EP_SIZE=$EP_SIZE cannot run." >&2
+                echo "       Drop EP_SIZE, or use A2A_BACKEND=none to get a free EP degree." >&2
+                exit 1
+            fi
+            EP_EFF="$TP_SIZE"
+            ;;
+        deepep_v2)
+            # Hard refusal, and not a judgement call: moe_hook.py's
+            # validate_deepep_v2_model_architecture() whitelists exactly
+            # ("DeepseekV3ForCausalLM", "DeepseekV4ForCausalLM",
+            # "Qwen3MoeForCausalLM") and raises ValueError for anything else.
+            # Hy4's config.json declares architectures ["HYV4ForCausalLM"], so
+            # this dies at config resolution -- before allocation, with a
+            # message about all-reduce after A2A combine.
+            echo "ERROR: A2A_BACKEND=deepep_v2 cannot run HYV4ForCausalLM." >&2
+            echo "       sglang's validate_deepep_v2_model_architecture() allows only" >&2
+            echo "       DeepseekV3/V4 and Qwen3Moe: other models may need an all-reduce" >&2
+            echo "       after A2A combine, which the v2 path skips. Use deepep." >&2
+            exit 1 ;;
+        megamoe)
+            echo "ERROR: A2A_BACKEND=megamoe is not wired for Hy4's sigmoid-scored," >&2
+            echo "       bounded-SwiGLU experts (the cookbook omits it deliberately)." >&2
+            exit 1 ;;
+        mori|ascend_fuseep|ascend_tp)
+            echo "ERROR: A2A_BACKEND=$A2A_BACKEND is for other silicon (mori = ROCm," >&2
+            echo "       ascend_* = NPU). This node is CUDA sm_103." >&2
+            exit 1 ;;
+        mooncake|nixl|flashinfer|pplx|customized)
+            # These exist in MoeA2ABackend and are EP-spanning, so they would run
+            # EP=TP -- but none of them is exercised on Hy4, and `mooncake`/`nixl`
+            # here mean the EXPERT all-to-all transport, which is a different
+            # thing from TRANSFER_BACKEND (the PD KV transport) that happens to
+            # share the name. Allow only with an explicit opt-in so nobody
+            # confuses the two by typo.
+            if [[ "${ALLOW_UNVALIDATED_A2A:-0}" != "1" ]]; then
+                echo "ERROR: A2A_BACKEND=$A2A_BACKEND is not exercised on Hy4." >&2
+                echo "       NOTE: mooncake/nixl HERE mean the MoE expert all-to-all" >&2
+                echo "       transport, NOT the PD KV transport -- that one is" >&2
+                echo "       TRANSFER_BACKEND=$TRANSFER_BACKEND and is unrelated." >&2
+                echo "       Set ALLOW_UNVALIDATED_A2A=1 to try it anyway." >&2
+                exit 1
+            fi
+            EP_EFF="$TP_SIZE"
+            ;;
+        *)
+            echo "ERROR: A2A_BACKEND must be one of none deepep (or, with" >&2
+            echo "       ALLOW_UNVALIDATED_A2A=1: mooncake nixl flashinfer pplx" >&2
+            echo "       customized). Got '$A2A_BACKEND'." >&2
+            exit 1 ;;
+    esac
+
+    # Arithmetic gates. These are the same ones sglang checks, but checking them
+    # here costs nothing and names the model constant that failed.
+    if (( TP_SIZE % EP_EFF != 0 )); then
+        echo "ERROR: EP=$EP_EFF does not divide TP=$TP_SIZE (moe_tp_size = TP/EP/moe_dp)." >&2
+        exit 1
+    fi
+    if (( N_ROUTED_EXPERTS % EP_EFF != 0 )); then
+        echo "ERROR: EP=$EP_EFF does not divide n_routed_experts=$N_ROUTED_EXPERTS." >&2
+        exit 1
+    fi
+    local moe_tp=$(( TP_SIZE / EP_EFF ))
+    if (( MOE_INTERMEDIATE % moe_tp != 0 )); then
+        echo "ERROR: moe_intermediate_size=$MOE_INTERMEDIATE does not divide by" >&2
+        echo "       moe_tp_size=$moe_tp (= TP $TP_SIZE / EP $EP_EFF)." >&2
+        exit 1
+    fi
+
+    if [[ "$A2A_BACKEND" != "none" ]]; then
+        MOE_ARGS+=(--moe-a2a-backend "$A2A_BACKEND")
+        # deepep_mode is a DeepEP-family knob; normal DISABLES both CUDA graphs
+        # (moe_hook.py logs "Cuda graph is disabled because deepep_mode=`normal`"),
+        # which on this model is a large, silent latency change -- decode graphs
+        # were worth 3.27x on K3. auto = normal for prefill, low_latency for decode.
+        if [[ "$A2A_BACKEND" == "deepep" ]]; then
+            MOE_ARGS+=(--deepep-mode "$DEEPEP_MODE")
+            if [[ "$DEEPEP_MODE" == "normal" ]]; then
+                echo "WARN: DEEPEP_MODE=normal disables CUDA graph capture for BOTH" >&2
+                echo "      prefill and decode. Any latency comparison against another" >&2
+                echo "      arm is then also a graph-on/graph-off comparison." >&2
+            fi
+        fi
+    fi
+    # Pass EP explicitly whenever it is not 1, including when it equals TP: the
+    # value in the log line then matches the value in the filename.
+    (( EP_EFF > 1 )) && MOE_ARGS+=(--ep-size "$EP_EFF")
+
+    if [[ -n "$DP_ATTN" && "$DP_ATTN" != "off" && "$DP_ATTN" != "0" ]]; then
+        if (( TP_SIZE % DP_ATTN != 0 )); then
+            echo "ERROR: DP_ATTN=$DP_ATTN must divide TP=$TP_SIZE." >&2
+            exit 1
+        fi
+        MOE_ARGS+=(--enable-dp-attention --dp-size "$DP_ATTN")
+    fi
+
+    # The filename fragment. Empty for the verified cell so its logs keep the
+    # names the first campaign used; otherwise every axis that moved is in it.
+    # A missing axis here does not produce a mislabelled row, it DELETES the
+    # other arm's log.
+    [[ "$A2A_BACKEND" != "none" ]] && MOE_TAG="${MOE_TAG}-a2a${A2A_BACKEND}"
+    [[ "$A2A_BACKEND" == "deepep" && "$DEEPEP_MODE" != "auto" ]] && MOE_TAG="${MOE_TAG}${DEEPEP_MODE}"
+    (( EP_EFF > 1 )) && MOE_TAG="${MOE_TAG}-ep${EP_EFF}"
+    [[ -n "$DP_ATTN" && "$DP_ATTN" != "off" && "$DP_ATTN" != "0" ]] && MOE_TAG="${MOE_TAG}-dp${DP_ATTN}"
+    return 0
+}
+
+# Host-side gate for the DeepEP arms: refuse to launch when the image has no
+# deep_ep module. Same reason require_efa_image() exists -- without the check the
+# failure lands ~10 minutes in, after the weight load, as an ImportError from
+# inside the first MoE layer's dispatcher construction.
+#
+# find_spec, not import: this container gets no --gpus, and deep_ep's extension
+# needs libcuda.so.1, so `import deep_ep` would fail on a perfectly good image.
+require_deepep_image() {
+    local img="$1"
+    if ! docker run --rm --entrypoint python3 "$img" -c \
+        'import importlib.util,sys; sys.exit(0 if importlib.util.find_spec("deep_ep") else 1)' 2>/dev/null
+    then
+        echo "ERROR: image '$img' has no deep_ep module, so A2A_BACKEND=deepep cannot run." >&2
+        echo "       The stock lmsysorg/sglang:hy4-preview image is built for the" >&2
+        echo "       cookbook's pure-TP recipes and is not required to ship DeepEP." >&2
+        echo "       Either use A2A_BACKEND=none EP_SIZE=$TP_SIZE (expert parallelism" >&2
+        echo "       with no all-to-all library, which needs nothing extra), or add" >&2
+        echo "       DeepEP to the image." >&2
+        exit 1
+    fi
 }
 
 # Fills MULTINODE_ARGS. Fails fast rather than hanging for --dist-timeout when

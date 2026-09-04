@@ -69,7 +69,7 @@ RUN cd /tmp && \
 # layer was first built, with nothing recording which.
 #
 # The ncclGinPlugin_v14 gate is kept from the K3 image even though nothing in a
-# Hy4 1P1D run needs EFA-GDA (each side is a single-node TP4 server, so NCCL
+# Hy4 1P1D run needs EFA-GDA (each side is a single-node TP server, so NCCL
 # never crosses the wire). It costs one `nm` and it is the only cheap way to
 # catch a mislabelled pre-GA tarball: a 1.50.0 whose ChangeLog also opens
 # `## [1.50.0]` can bundle aws-ofi-nccl 1.20.0-1, which exports only v11/v13.
@@ -139,7 +139,7 @@ RUN TORCH_LIB=$(python3 -c "import torch, os; print(os.path.dirname(torch.__file
 # entry, so it loads the plugin, assigns type 5, and then dies in
 # ncclGinDevCommSetup with "Cannot get backend version for invalid GIN type 5".
 #
-# Nothing in a Hy4 1P1D run needs that -- each side is single-node TP4, so NCCL
+# Nothing in a Hy4 1P1D run needs that -- each side is single-node TP, so NCCL
 # stays on NVLink and the KV wire is Mooncake, not NCCL. So this layer is
 # forward-looking, and it has a cost worth stating: it makes this image's
 # intra-node TP all-reduce a DIFFERENT NCCL from the stock image the single-node
