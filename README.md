@@ -246,6 +246,7 @@ because a typo between them would otherwise "work".
 ```
 00_download_models.sh     hf download -> /opt/dlami/nvme/models/  (758 G MXFP8)
 env_common.sh             all config + the traps, sourced by host AND container
+04_fix_multinic_routing.sh HOST, EVERY NODE, EVERY BOOT: the 17-ENI routing fix
 05_pull_pd_image.sh       pull hy4-preview-efa from ECR instead of rebuilding
 10_launch_standalone.sh   single-node container (stock image)
 20_launch_prefill.sh      1P1D prefill side  -> _pd_launch.sh
@@ -355,6 +356,9 @@ BF16 row would not share it, and a 1P1D row does not either -- it is 2x TP.
 ## 1P1D PD disaggregation (B300-1 prefill, B300-2 decode)
 
 ```bash
+# EVERY node, EVERY boot -- nothing cross-node works without it (see below):
+bash 04_fix_multinic_routing.sh
+
 # ONCE, on one host (~10-15 min, no GPU needed), then push:
 docker build -t hy4-preview-efa:latest -f Dockerfile .
 
@@ -378,6 +382,37 @@ whole nodes and `BENCH_GPUS` is 16, which is the `out tok/s/GPU` denominator.
 `EP_SIZE` / `DP_ATTN`) must **match on both sides**: none of them is negotiated at
 handshake time, and a mismatch shows up as a stalled request or a blacklisted
 Mooncake session rather than as a startup error.
+
+### The 17-ENI routing trap: run `04_fix_multinic_routing.sh` after every boot
+
+These instances come up with **17 ENA "interface" ENIs in one subnet** on top of
+the 16 efa-only ones. `ec2-net-utils` writes an `ip rule` for each *secondary* IP
+(tables 101-116) but not for the primary, and in the main table the 16 secondary
+`172.31.16.0/20 ... proto kernel` routes carry metric 0 against the primary's
+100. So a packet sourced from the primary IP egresses a *secondary* ENI, that
+ENI's source/destination check rejects a source address it does not own, and the
+frame is dropped before the wire. Captured on B300-2 while B300-1 pinged it:
+
+```
+enp71s0  In  IP 172.31.17.128 > 172.31.29.80: ICMP echo request     <- arrives
+enp170s0 Out IP 172.31.29.80 > 172.31.17.128: ICMP echo reply       <- wrong NIC
+```
+
+Requests arrive, replies vanish: 100% loss between two instances in one subnet
+whose security group already allows all traffic from itself. Every AWS-side check
+passes (SG, subnet, NACL, source/dest flag, `hostname -I`), ssh works, and
+`/health` returns 200 on each node *locally* -- so it reads as a security group
+that was not reattached after the relaunch, and `22_launch_router.sh`'s
+"not accepting connections" reads as a server still loading, which a cold Hy4
+genuinely does for ~10 min. **Ping the peer.** If ICMP fails too, no server is
+involved. The router now makes that distinction for you and names the fix.
+
+`bash 04_fix_multinic_routing.sh` adds one source rule per node
+(`from <primary> lookup 100`) and pings the configured peers to prove it took.
+`--check` reports without changing anything and exits 1 when broken. It must run
+on **both** ends -- the drop is on the reply path -- and it is **not persistent**
+by design, so it is lost on every reboot. Verified 2026-09-05: all 12 ordered
+pairs across B300-1/2/3/4 ping after it, none of the cross pairs did before.
 
 ### Why PD needs its own image
 
@@ -480,6 +515,38 @@ the decode side that is the concurrency ceiling of **the whole pair**. A c=256
 benchmark against this arm is measuring a 48-slot queue unless `MAX_RUNNING` is
 set explicitly -- and if you set it, put it in the results tag.
 
+### Measured: the first 1P1D point, and the proof it went over EFA
+
+2026-09-05, B300-1 prefill / B300-2 decode, MXFP8, **TP8 per side**, MTP on,
+`TRANSFER_BACKEND=mooncake`, EP=1, 1024 in / 1024 out, c=16, n=64:
+
+| out tok/s | total tok/s | req/s | live conc | TTFT med / mean / p99 | TPOT med | ITL med |
+|---|---|---|---|---|---|---|
+| 1128.79 | 2257.58 | 1.10 | 14.69 | 1065 / 2690 / 6089 ms | 10.00 ms | 38.49 ms |
+
+Read it as a functional result, not a competitive one. `ITL / TPOT = 3.85`, which
+is MTP accepting close to its full 4 tokens per step. And the pair spans **16
+GPUs** holding two complete copies of the weights, so 70.5 out tok/s/GPU against
+the single-node TP4 arm's 202.8 at the same c=16 -- c=16 cannot load a 16-GPU
+pair, and the decode side's 48-slot ceiling is the thing to push against before
+any PD-vs-single-node claim is worth making.
+
+**Mooncake really carried the KV over EFA** -- image-capable is not
+went-over-EFA, so this was checked three ways rather than grepped for once:
+
+* both sides log `EfaTransport` installed with `provider: efa`, and across the
+  whole run there is not one `fi_write failed`, `session ... is not alive`,
+  `blacklist`, `KVTransferError` or `TcpTransport`;
+* the EFA **hardware** counters agree exactly. Over 5 requests, prefill's
+  `rdma_write_bytes` rose by 260,229,120 B in 6,720 `rdma_write_wrs` while
+  decode's `rx_bytes` rose by the same 260,229,120 B -- a one-way RDMA-write push
+  from prefill to decode, which is the shape the transfer is supposed to have;
+* decode's `tx_bytes` did not move, confirming nothing came back over the KV
+  path. Counters live in
+  `/sys/class/infiniband/rdmap*/ports/1/hw_counters/`; read them on the **host**,
+  before and after, and diff -- they are the only source here that a
+  configuration mistake cannot fake.
+
 ---
 
 ## Benchmarking rules this kit enforces
@@ -521,9 +588,14 @@ set explicitly -- and if you set it, put it in the results tag.
   by the cluster shutdown; `results/` therefore contains a header-only log for it,
   which `gen_bench_table.py` reports under "NO rc IN HEADER" rather than treating
   as a row. This is the point that would locate the MTP crossover, if there is one.
-* **1P1D numbers.** Nothing was measured. Resuming needs only:
+* **1P1D is one point wide.** c=16 at 1k/1k exists and Mooncake/EFA is proven
+  (above); the ladder does not. c=16 leaves a 16-GPU pair idle, so the interesting
+  rows are the ones that push the decode side's 48 slots -- and the pair has to be
+  compared against a **TP8 single node**, which also does not exist yet, not
+  against the TP4 rows. Resuming a cold pair:
 
   ```bash
+  bash 04_fix_multinic_routing.sh       # every node, or nothing talks
   # the instance store is WIPED by stop/start -- re-download the weights first:
   bash 00_download_models.sh mxfp8      # ~4 min at ~3 GB/s, per host
   bash 05_pull_pd_image.sh              # ~75 s, the image itself is in ECR
@@ -534,12 +606,6 @@ set explicitly -- and if you set it, put it in the results tag.
   `results/` lives on the EBS root volume, so it survives a stop/start; the weights
   under `/opt/dlami/nvme` do not. Budget ~15 min from a cold stopped instance to the
   first PD request.
-* **The Mooncake KV path was never observed carrying traffic.** Both sides came up
-  with `MOONCAKE_PROTOCOL=efa` exported and the EFA-verified image, but "the image
-  can do EFA" is not "the transfer went over EFA". Before quoting any PD number,
-  grep the prefill log for the mooncake protocol line and for `fi_mr_reg` failures,
-  and confirm a non-zero KV-transfer count -- a silent fallback is exactly the
-  failure this whole image exists to prevent.
 * **BF16 TP8** arm never run (`QUANT=bf16` is wired and is a verified cell).
 * The base image tag `lmsysorg/sglang:hy4-preview` is a **moving tag** and is not
   pinned by digest. Pin it before a real measurement campaign, or a re-pull

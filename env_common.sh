@@ -162,8 +162,11 @@ PORT="${PORT:-30000}"
 # exist. Defaults are the 1P1D pair the user asked for: B300-1 prefills,
 # B300-2 decodes. Private (ENA) IPs -- these change on a stop/start, so read
 # them from `hostname -I` rather than trusting this line after a restart.
-PREFILL_IPS="${PREFILL_IPS:-172.31.30.164}"
-DECODE_IPS="${DECODE_IPS:-172.31.28.101}"
+# Re-read 2026-09-05 after the relaunch; the previous 172.31.30.164/28.101 pair
+# belonged to the pre-relaunch cluster and no longer exists. B300-3 is
+# 172.31.26.115 and B300-4 is 172.31.26.251 if you need a 2P2D.
+PREFILL_IPS="${PREFILL_IPS:-172.31.17.128}"   # B300-1
+DECODE_IPS="${DECODE_IPS:-172.31.29.80}"      # B300-2
 # The prefill side's KV-handshake port. Distinct from $PORT (HTTP): the router
 # gets both, and the decode side connects to this one directly.
 BOOTSTRAP_PORT="${BOOTSTRAP_PORT:-8998}"

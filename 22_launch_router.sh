@@ -36,13 +36,25 @@ for ip in $DECODE_IPS;  do echo "decode  : http://${ip}:${PORT}"; done
 
 # A node that is not up yet fails registration and the router EXITS, so probe the
 # HTTP ports first -- otherwise the only symptom is a router that vanished.
+#
+# A refused connection has two very different causes and the same message, so
+# separate them with ICMP: a loading server answers ping, a mis-routed node does
+# not. Do not skip this -- we lost an hour to the wrong one of the two.
 for ip in $PREFILL_IPS $DECODE_IPS; do
-    (exec 3<>"/dev/tcp/${ip}/${PORT}") 2>/dev/null \
-      || { echo "FATAL: ${ip}:${PORT} is not accepting connections."; \
-           echo "       Start 20_/21_ on every node and wait for 'server is fired up'"; \
-           echo "       (a cold Hy4 needs ~10 min: 758 GB of weights, then deep_gemm"; \
-           echo "        JIT and CUDA-graph capture -- the JIT stall reads like a hang)."; \
-           exit 1; }
+    (exec 3<>"/dev/tcp/${ip}/${PORT}") 2>/dev/null && continue
+    echo "FATAL: ${ip}:${PORT} is not accepting connections."
+    if ping -c1 -W2 "$ip" >/dev/null 2>&1; then
+        echo "       The host is reachable, so this is a server that is not up yet:"
+        echo "       start 20_/21_ on every node and wait for 'server is fired up'"
+        echo "       (a cold Hy4 needs ~10 min: 758 GB of weights, then deep_gemm"
+        echo "        JIT and CUDA-graph capture -- the JIT stall reads like a hang)."
+    else
+        echo "       ${ip} does not answer PING either, so no server is involved:"
+        echo "       this is the 17-ENI asymmetric-routing trap, not a security"
+        echo "       group. Run 'bash 04_fix_multinic_routing.sh' on EVERY node"
+        echo "       (including this one) -- it is lost on every reboot."
+    fi
+    exit 1
 done
 
 # The model must be mounted: the router asks each worker for its model path, gets
