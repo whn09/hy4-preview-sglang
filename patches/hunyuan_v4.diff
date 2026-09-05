@@ -1,0 +1,42 @@
+--- /tmp/hyv4_orig.py	2026-09-05 08:27:08
++++ /tmp/hyv4_new.py	2026-09-05 08:30:40
+@@ -9,6 +9,7 @@
+ logger = logging.getLogger(__name__)
+ 
+ from sglang.srt.distributed import get_pp_group
++from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+ from sglang.srt.layers.attention.index_topk_share import IndexTopKShareState
+ from sglang.srt.layers.communicator import AttentionInputs, get_attn_tp_context
+ from sglang.srt.layers.layernorm import RMSNorm
+@@ -647,6 +648,31 @@
+     @classmethod
+     def shared_experts_fusion_disable_reason(cls, hf_config, quant_config):
+         return "HYV4 applies the SwiGLU limit only to routed experts."
++
++    # Required by EVERY DeepEP arm, v1 and v2 alike.
++    #
++    # HYV4ForCausalLM subclasses nn.Module + DeepseekV2WeightLoaderMixin rather
++    # than DeepseekV2ForCausalLM, so it does not inherit this hook -- but its
++    # sparse layers ARE DeepseekV2MoE, and DeepseekV2MoE.forward_deepep() calls
++    # ExpertLocationDispatchInfo.init_new(), which asserts on the global
++    # expert-location metadata. Without this classmethod,
++    # ModelConfigForExpertLocation.from_model_config() returns None,
++    # ExpertLocationMetadata.init_trivial() propagates the None, and the assert
++    # fires -- on a value init_new() would have thrown away one line later, so
++    # the traceback is a bare AssertionError with no message. It lands ~3 min
++    # after the weight load, during decode CUDA-graph capture, which makes it
++    # look like a graph/memory problem rather than a missing model hook.
++    #
++    # The three fields are DeepSeek's and the Hy4-preview checkpoint uses the
++    # same names verbatim (num_hidden_layers=78, n_routed_experts=256,
++    # n_group=1), so this is DeepseekV2ForCausalLM's body unchanged.
++    @classmethod
++    def get_model_config_for_expert_location(cls, config):
++        return ModelConfigForExpertLocation(
++            num_layers=config.num_hidden_layers,
++            num_logical_experts=config.n_routed_experts,
++            num_groups=config.n_group,
++        )
+ 
+     def __init__(self, config, quant_config=None, prefix=""):
+         super().__init__()

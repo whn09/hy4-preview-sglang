@@ -54,6 +54,11 @@ if docker inspect "$NAME" >/dev/null 2>&1; then
     exit 1
 fi
 
+# Foreign tenant on these GPUs? A PD arm is the worst place to find out, because
+# the prefill node can load fine while the decode node OOMs and the only visible
+# symptom is a router that says the peer is "not accepting connections".
+[[ "${ALLOW_BUSY_GPUS:-0}" == "1" ]] || require_free_gpus "$GPU_LIST"
+
 # TOPO is the benchmark's topology axis, read back out of the container by
 # 91_bench.sh. BENCH_GPUS is the tok/s/GPU denominator and it is NOT $TP_SIZE
 # here: a 1P1D pair occupies TP_SIZE GPUs on each of two hosts. Getting this
@@ -91,6 +96,7 @@ docker run -d --name "$NAME" \
     -e DP_ATTN="${DP_ATTN:-}" \
     -e ALLOW_UNVALIDATED_A2A="${ALLOW_UNVALIDATED_A2A:-0}" \
     -e V2_CAP="$V2_CAP" \
+    -e SPEC_A2A_BACKEND="${SPEC_A2A_BACKEND:-}" \
     -e MODEL_PATH="$MODEL_PATH" \
     -e SERVED_MODEL_NAME="$SERVED_MODEL_NAME" \
     -e CONTEXT_LEN="${CONTEXT_LEN:-}" \

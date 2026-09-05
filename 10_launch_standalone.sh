@@ -38,6 +38,12 @@ build_moe_args
 # deepep_v2 needs three source patches, one of which is a numerics fix, so
 # the image is verified by a marker rather than trusted.
 [[ "$A2A_BACKEND" == "deepep_v2" ]] && require_deepep_v2_image "$IMAGE"
+# Cross-node, DeepEP has to reach the NIC, and on EFA that means NCCL GIN. The
+# thin v2 image is the stock image plus 3 .py files, so it has neither NCCL 2.31
+# nor the ofi-nccl plugin -- single-node only.
+if (( NNODES > 1 )) && [[ "$A2A_BACKEND" == deepep* ]]; then
+    require_gin_capable_image "$IMAGE"
+fi
 
 # Pin the ranks rather than exposing all 8 GPUs even at TP8: the device set then
 # belongs to the container's config instead of being an accident of which GPUs
@@ -50,10 +56,40 @@ fi
 
 docker rm -f "$NAME" 2>/dev/null || true
 
+# ... and only now, with this kit's own container gone, ask whether the GPUs are
+# actually free. Order matters: before the rm -f, our own previous run would
+# always look like a foreign tenant.
+[[ "${ALLOW_BUSY_GPUS:-0}" == "1" ]] || require_free_gpus "$GPU_LIST"
+
+# Variables forwarded ONLY when actually set, because for several of these an
+# empty string is not the same as unset: `NCCL_GIN_TYPE=` makes NCCL parse ""
+# rather than auto-detect, and export_gin_envs() decides by emptiness too. So a
+# blanket `-e VAR="${VAR:-}"` would silently pin every one of these to "".
+#   NCCL_GIN_TYPE / _IB_HCA / _SYM_GIN_KERNELS_ENABLE : override export_gin_envs's
+#     choice by hand (it resolves them from NNODES + the device list otherwise).
+#   EP_JIT_* : DeepEP's own JIT knobs. EP_JIT_PRINT_COMPILER_COMMAND and
+#     EP_JIT_DEBUG are the only way to see WHY a JIT build failed -- the C++ side
+#     asserts `exit_code == 0` at kernel_runtime.hpp:33 and prints nothing else.
+#   EP_JIT_CACHE_DIR : point it at a bind mount to keep cubins across runs, or per
+#     image to avoid the header-hash collision (deep_ep hashes includes, not
+#     header CONTENT, so two images sharing a cache dir can read each other's
+#     cubins and a header-only change measures as a no-op).
+PASSTHRU_ARGS=()
+for v in DEEPEP_V2_MODE V2_CAP CUDA_HOME \
+         NCCL_GIN_TYPE NCCL_IB_HCA NCCL_SYM_GIN_KERNELS_ENABLE \
+         NCCL_DEBUG NCCL_DEBUG_SUBSYS \
+         EP_JIT_DEBUG EP_JIT_PRINT_COMPILER_COMMAND EP_JIT_CACHE_DIR; do
+    [[ -n "${!v:-}" ]] && PASSTHRU_ARGS+=(-e "$v=${!v}")
+done
+
 # --net=host: needed at NNODES>1 for EFA/ENA device discovery, and it keeps
 #   :$PORT reachable without a published-port hop.
-# --device=/dev/infiniband: EFA. Unused at NNODES=1, cheap, and its absence is
-#   what makes a later 2-node attempt fail with "no network".
+# --device=/dev/infiniband: EFA, and NOT only for multi-node. A DeepEP arm needs
+#   it even at NNODES=1: deep_ep asserts that NCCL resolved a GIN backend
+#   (csrc/kernels/backend/nccl.cu:87) whether or not anything crosses the wire,
+#   and with no device visible NCCL reports GIN type NONE and the assert fires.
+#   For non-DeepEP arms it is unused, cheap, and its absence is what makes a later
+#   2-node attempt fail with "no network".
 # --shm-size=64g: 169 shards / 760GB move through /dev/shm during load.
 # --cap-add SYS_NICE: without it every rank logs "User lacks permission to set NUMA
 #   affinity, skipping NUMA node configuration for GPU" and runs with whatever
@@ -62,6 +98,38 @@ docker rm -f "$NAME" 2>/dev/null || true
 # --init: TP leaves unreaped children, and without an init as PID 1 `docker rm -f`
 #   fails with "PID ... is zombie and can not be killed" -- which then aborts the
 #   NEXT launch under set -e. (Hit on the K3 kit 2026-09-04.)
+
+# --privileged + /dev/gdrdrv, for DeepEP arms only.
+#
+# GIN type 5 (EFA_GDA) works by having the GPU write a 64-byte WQE and ring the
+# NIC's doorbell in MMIO itself (reference_efa_gda_mechanism). Mapping that
+# doorbell BAR into the GPU's address space needs more than --device on the uverbs
+# nodes, and when it fails NOTHING says "permission": NCCL simply reports the RAIL
+# team's GIN type as NONE, and deep_ep aborts at
+# csrc/kernels/backend/nccl.cu:101 with text about "a network configuration
+# issue". Measured 2026-09-05 on B300-3/4: identical images, identical
+# NCCL_GIN_TYPE=5 / _SYM_GIN_KERNELS_ENABLE=0 / _IB_HCA=rdmap, TP16 NCCL comm
+# healthy across the two nodes -- and railedGinType NONE until this was added.
+# The K3 kit reached the same conclusion from the other direction and made every
+# arm privileged so that "a GIN init failure could be a permissions artefact"
+# stopped being a live hypothesis.
+#
+# Note the ASYMMETRY that makes this easy to miss: a single-node DeepEP arm keeps
+# its whole a2a on NVLink, so it never touches the doorbell and comes up
+# privileged or not. This only bites at NNODES>1, i.e. in the hybrid mode that
+# reads props.railedGinType instead of props.ginType.
+#
+# Scoped to deepep* rather than applied blanket, so the non-DeepEP reference arm
+# keeps the smaller capability set and stays comparable to what the cookbook runs.
+PRIV_ARGS=()
+if [[ "$A2A_BACKEND" == deepep* ]]; then
+    PRIV_ARGS+=(--privileged)
+    # GDRCopy. Absent unless the DKMS module is loaded and /dev/gdrdrv was
+    # mknod'd by hand (gdrdrv has no udev rule -- feedback_gdrdrv_after_kernel_upgrade);
+    # NCCL falls back without it, so this is an optimization, not a requirement.
+    [[ -e /dev/gdrdrv ]] && PRIV_ARGS+=(--device=/dev/gdrdrv)
+fi
+
 docker run -d --name "$NAME" \
     --init \
     --gpus "\"device=${GPU_LIST}\"" \
@@ -69,6 +137,7 @@ docker run -d --name "$NAME" \
     --ulimit memlock=-1 --ulimit stack=67108864 \
     --cap-add SYS_NICE \
     --device=/dev/infiniband \
+    ${PRIV_ARGS[@]+"${PRIV_ARGS[@]}"} \
     --shm-size=64g \
     -v "$HOST_MODEL_DIR/$MODEL_DIRNAME:$MODEL_PATH:ro" \
     "${CACHE_ARGS[@]}" \
@@ -85,6 +154,8 @@ docker run -d --name "$NAME" \
     -e DP_ATTN="${DP_ATTN:-}" \
     -e ALLOW_UNVALIDATED_A2A="${ALLOW_UNVALIDATED_A2A:-0}" \
     -e V2_CAP="$V2_CAP" \
+    -e SPEC_A2A_BACKEND="${SPEC_A2A_BACKEND:-}" \
+    "${PASSTHRU_ARGS[@]}" \
     -e MODEL_PATH="$MODEL_PATH" \
     -e SERVED_MODEL_NAME="$SERVED_MODEL_NAME" \
     -e CONTEXT_LEN="${CONTEXT_LEN:-}" \

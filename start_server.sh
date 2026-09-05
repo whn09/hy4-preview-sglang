@@ -26,6 +26,11 @@ setup_runtime_env
 build_multinode_args
 build_pd_args
 build_moe_args
+# NCCL GIN, which every DeepEP arm needs -- including a single-node one, because
+# deep_ep asserts a GIN backend exists even when nothing crosses the wire. Runs
+# here rather than in the launcher because /sys/class/infiniband is a property of
+# the container, and this is the process that consumes the variables.
+export_gin_envs
 
 # ---- MTP (NextN) speculative decoding ----
 # One draft layer (model.mtp_layers.0, ~10B params) ships in BOTH checkpoints, so
@@ -80,6 +85,10 @@ echo "=== Hy4-preview: quant=${QUANT} tp=${TP_SIZE} nodes=${NNODES}/rank${NODE_R
 echo "    moe: a2a=${A2A_BACKEND} ep=${EP_EFF} moe_tp=$(( TP_SIZE / EP_EFF ))" \
      "deepep_mode=$([[ $A2A_BACKEND == deepep ]] && echo "$DEEPEP_MODE" || echo n/a)" \
      "dp_attn=${DP_ATTN:-off} -> ${MOE_ARGS[*]:-<none, pure TP>}"
+if [[ "$A2A_BACKEND" == deepep* ]]; then
+    echo "    gin: NCCL_GIN_TYPE=${NCCL_GIN_TYPE:-unset} NCCL_SYM_GIN_KERNELS_ENABLE=${NCCL_SYM_GIN_KERNELS_ENABLE:-unset}" \
+         "NCCL_IB_HCA=${NCCL_IB_HCA:-unpinned} v2_cap=${SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK:-n/a}"
+fi
 if [[ -n "${PD_ROLE:-}" ]]; then
     echo "    MOONCAKE_PROTOCOL=${MOONCAKE_PROTOCOL:-} MC_MAX_CONCURRENT_REG_MR=${MC_MAX_CONCURRENT_REG_MR:-}" \
          "PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-}" \

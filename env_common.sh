@@ -112,6 +112,12 @@ SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-$MODEL_REPO}"
 A2A_BACKEND="${A2A_BACKEND:-none}"
 EP_SIZE="${EP_SIZE:-}"            # empty => 1 (pure TP MoE), the verified cell
 DEEPEP_MODE="${DEEPEP_MODE:-auto}"  # auto | normal | low_latency
+# deepep_v2's own mode. direct = every expert byte stays on NVLink (the only
+# sensible single-node setting); hybrid = intra-node NVLink + inter-node NIC.
+# Left empty here and resolved from NNODES in build_moe_args(), so a 2-node
+# launch cannot silently run the single-node mode.
+DEEPEP_V2_MODE="${DEEPEP_V2_MODE:-}"   # direct | hybrid
+DEEPEP_V2_MODE_SET="${DEEPEP_V2_MODE:+1}"
 # Attention DP, the other knob the cookbook exposes for Hy4 (values off/4/8/16,
 # TP must be divisible by it). Off by default: it is offered upstream but is not
 # part of any verified cell, and on an MLA model it changes the KV pool shape, so
@@ -421,6 +427,44 @@ build_moe_args() {
                 echo "      Set MAX_RUNNING <= $(( V2_CAP / 4 )) (or raise V2_CAP) if the server" >&2
                 echo "      refuses with 'decode CUDA graph exceeds'." >&2
             fi
+            # BLOCKER 4, found by running it, and the one that should NOT be
+            # patched away: the DRAFT model inherits moe_a2a_backend, and
+            # validate_deepep_v2_speculative_draft() (moe_hook.py:343) refuses
+            # deepep_v2 as a draft backend. MTP on is this kit's default profile,
+            # so the inherit fires and the server dies at config resolution
+            # *after* logging "DeepEP v2 MoE is enabled ... ep adjusted to 8" --
+            # which makes the three patched gates look like they failed when they
+            # had already passed:
+            #   ValueError: DeepEP v2 MoE is not validated as a speculative draft
+            #   backend. Select another --speculative-moe-a2a-backend.
+            # Upstream names the escape hatch, so take it instead of patching a
+            # fourth file: give the DRAFT its own backend. `none` leaves the draft
+            # on the plain pure-TP MoE path, so the code under test stays confined
+            # to the target model and the draft is not a second variable.
+            #
+            # The "--speculative-moe-a2a-backend must equal the target's" rule at
+            # speculative_hook.py:383 does NOT apply: it is inside the DSpark +
+            # dp-attention branch, and this arm is NextN MTP with DP_ATTN off.
+            # PROFILE=high-throughput drops the draft entirely and makes this a
+            # no-op -- but it also changes MTP, which is a separate axis.
+            if [[ "$SPEC" == "on" ]]; then
+                SPEC_A2A_BACKEND="${SPEC_A2A_BACKEND:-none}"
+                if [[ "$SPEC_A2A_BACKEND" == "deepep_v2" ]]; then
+                    echo "ERROR: SPEC_A2A_BACKEND=deepep_v2 is precisely what upstream refuses" >&2
+                    echo "       (validate_deepep_v2_speculative_draft). Use none or deepep, or" >&2
+                    echo "       PROFILE=high-throughput to drop the draft model." >&2
+                    exit 1
+                fi
+                MOE_ARGS+=(--speculative-moe-a2a-backend "$SPEC_A2A_BACKEND")
+            fi
+            # direct keeps every expert byte on NVLink and is right for one node;
+            # it cannot be right for two, so resolve from NNODES unless the caller
+            # asked for something explicitly (the broken combination stays
+            # testable, it just is not reachable by accident).
+            if [[ -z "$DEEPEP_V2_MODE_SET" ]]; then
+                if (( NNODES > 1 )); then DEEPEP_V2_MODE=hybrid; else DEEPEP_V2_MODE=direct; fi
+            fi
+            MOE_ARGS+=(--deepep-v2-mode "$DEEPEP_V2_MODE")
             EP_EFF="$TP_SIZE"
             ;;
         megamoe)
@@ -508,7 +552,11 @@ build_moe_args() {
     # The v2 capacity is an axis, not a detail: it bounds the decode CUDA graph and
     # sizes the ElasticBuffer, so a cap-512 row and a cap-2048 row must not share a
     # filename.
-    [[ "$A2A_BACKEND" == "deepep_v2" ]] && MOE_TAG="${MOE_TAG}cap${V2_CAP}"
+    [[ "$A2A_BACKEND" == "deepep_v2" ]] && MOE_TAG="${MOE_TAG}cap${V2_CAP}${DEEPEP_V2_MODE:+-$DEEPEP_V2_MODE}"
+    # The draft's own a2a backend is an axis too: with MTP on, `none` and `deepep`
+    # put the NextN layer's MoE on different code, and only the default is silent.
+    [[ "$A2A_BACKEND" == "deepep_v2" && "$SPEC" == "on" && "${SPEC_A2A_BACKEND:-none}" != "none" ]] \
+        && MOE_TAG="${MOE_TAG}draft${SPEC_A2A_BACKEND}"
     # CHUNKED_PREFILL is not a MoE knob, but MOE_TAG is the only fragment that
     # reaches the results filename (91_bench.sh builds TAG from TOPO), and the v2
     # arm cannot run at the default chunk -- so a v2 row and any earlier
@@ -543,14 +591,159 @@ require_deepep_image() {
         echo "       DeepEP to the image." >&2
         exit 1
     fi
+    # v1 needs the SAME image as v2, for one of the four patches. Measured
+    # 2026-09-05: HYV4ForCausalLM has no get_model_config_for_expert_location, so
+    # the global expert-location metadata is None and DeepseekV2MoE.forward_deepep
+    # -> ExpertLocationDispatchInfo.init_new() trips a bare AssertionError. That
+    # is a shared code path, so it kills v1 exactly as it kills v2 -- and it does
+    # so ~13 min in, during decode CUDA-graph capture, long after the launch
+    # looked successful. patches/hunyuan_v4.diff supplies the hook, and the other
+    # three patches in that image are inert when the backend is not deepep_v2.
+    if ! docker run --rm --entrypoint cat "$img" /etc/hy4-deepep-v2-patched >/dev/null 2>&1; then
+        echo "ERROR: image '$img' has deep_ep but not patches/hunyuan_v4.diff, so" >&2
+        echo "       A2A_BACKEND=deepep will die during decode CUDA-graph capture" >&2
+        echo "       with a bare AssertionError (expert_location_dispatch.py)." >&2
+        echo "       The v1 and v2 arms share one image here:" >&2
+        echo "         docker build -t hy4-preview-v2:latest -f Dockerfile.deepep_v2 ." >&2
+        echo "         IMAGE=hy4-preview-v2:latest A2A_BACKEND=deepep ..." >&2
+        echo "       (The three v2-specific patches in that image do nothing" >&2
+        echo "       unless moe_a2a_backend == deepep_v2, so the pair stays" >&2
+        echo "       one-variable. See patches/README.md.)" >&2
+        exit 1
+    fi
+}
+
+# ---- NCCL GIN, which is how DeepEP v2 reaches a NIC ----
+#
+# Ported from ../kimi-k3-sglang/env_common.sh, where every line of it was paid
+# for on this same p6-b300 hardware. Read that file's GIN block for the full
+# account; the operative facts:
+#
+#   * deep_ep asserts ginType != NONE even for a single-node `direct` run
+#     (csrc/kernels/backend/nccl.cu:87). So a GIN backend must initialize even
+#     when nothing crosses the wire -- which also means --device=/dev/infiniband
+#     is required at NNODES=1, or NCCL sees no network and reports NONE.
+#   * type 5 = EFA_GDA is the one to want WHEN THE INSTANCE IS CROSS-NODE: the GPU
+#     writes the WQE and rings the doorbell itself, and this box's 16 EFA rails
+#     carry 100 GB/s per GPU while its 2 ConnectX-7 planes are a side channel.
+#     Type 3 = GDAKI would route every scale-out byte through a CPU proxy AND
+#     leave the EFA fabric idle.
+#   * BUT type 5 cannot come up on a SINGLE-NODE instance, and that is the rule
+#     this function exists to encode. Measured twice on p6-b300:
+#       - K3, 2026-09-04: single-node ep=8 mode=direct -> `_C.ElasticBuffer(...)`
+#         dies at nccl.cu:188 "GIN: DevComm setup failed on all available
+#         backends"; the same host and image with type 3 comes up clean, and the
+#         same host runs type 5 happily as rank 1 of a 2-node hybrid instance.
+#       - Hy4, 2026-09-05: single-node ep=8 mode=direct, NCCL_GIN_TYPE=5 accepted
+#         and logged, then nccl.cu:101 "(props.ginType) != NCCL_GIN_TYPE_NONE".
+#     Both surface as "Capture cuda graph failed" from init_all_cuda_graphs, ~4
+#     min in, which reads as a graph or memory problem rather than a fabric one.
+#     So: NNODES is the primary axis, device inventory only the secondary one.
+#     This costs nothing -- a single-node instance keeps its a2a on NVLink and
+#     never touches the NIC; GIN merely has to EXIST for deep_ep's assert.
+#   * type 5 is really THREE settings, and omitting any one looks like a
+#     different bug:
+#       1. NCCL >= 2.31           -- an IMAGE property; the Dockerfile checks it.
+#       2. NCCL_SYM_GIN_KERNELS_ENABLE=0 -- always paired with type 5. NCCL's
+#          symmetric-memory GIN kernels need strong signals, which the libfabric
+#          GIN plugin does not implement.
+#       3. NCCL_IB_HCA=rdmap on a MIXED device list. This box lists 16 rdmap*
+#          (EFA) plus 2 ibp* (ConnectX-7); without the prefix pin NCCL builds
+#          only 2 GIN NICs off the ibp* pair and a rank dies. `rdmap` is a
+#          PREFIX, so one word covers all 16 rails.
+#
+# Called from start_server.sh, i.e. INSIDE the container -- /sys/class/infiniband
+# is visible there and it is the process that actually needs the variables. A
+# caller who sets NCCL_GIN_TYPE keeps it; this only fills in what is unset.
+export_gin_envs() {
+    [[ "$A2A_BACKEND" == deepep* ]] || return 0
+    local devs="" efa=0 other=0
+    [[ -d /sys/class/infiniband ]] && devs="$(ls /sys/class/infiniband 2>/dev/null)"
+    if [[ -z "$devs" ]]; then
+        echo "WARN: no /sys/class/infiniband devices visible. DeepEP will report GIN" >&2
+        echo "      type NONE and abort in nccl.cu:87 even at NNODES=1. The container" >&2
+        echo "      needs --device=/dev/infiniband." >&2
+        return 0
+    fi
+    efa=$(grep -c '^rdmap' <<<"$devs" || true)
+    other=$(grep -cv '^rdmap' <<<"$devs" || true)
+
+    if [[ -z "${NCCL_GIN_TYPE:-}" ]]; then
+        if (( NNODES > 1 )) && (( efa > 0 )); then
+            NCCL_GIN_TYPE=5
+        else
+            NCCL_GIN_TYPE=3
+        fi
+    fi
+    export NCCL_GIN_TYPE
+
+    if [[ "$NCCL_GIN_TYPE" == "5" ]]; then
+        # The pair. Setting type 5 without this crashes in NCCL's symmetric GIN
+        # kernels, so it is not an independent knob.
+        export NCCL_SYM_GIN_KERNELS_ENABLE="${NCCL_SYM_GIN_KERNELS_ENABLE:-0}"
+        # Prefix pin, and only on a mixed list. On a pure-rdmap box the pin is
+        # unnecessary and is only a chance to get the prefix wrong.
+        (( other > 0 )) && export NCCL_IB_HCA="${NCCL_IB_HCA:-rdmap}"
+    else
+        # GDAKI: pin ONE active plane. Never a bare rdmap* device name here -- the
+        # two CX-7 planes on this box have no path between them, so NCCL must not
+        # straddle them, and a single EFA rail would hide the other 15. Prefer ibp*
+        # / mlx* and fall back to whatever is ACTIVE.
+        if [[ -z "${NCCL_IB_HCA:-}" ]]; then
+            local d st
+            for d in /sys/class/infiniband/ibp* /sys/class/infiniband/mlx* /sys/class/infiniband/*; do
+                [[ -e "$d" ]] || continue
+                st="$(cat "$d"/ports/1/state 2>/dev/null || true)"
+                [[ "$st" == *ACTIVE* ]] && { export NCCL_IB_HCA="$(basename "$d")"; break; }
+            done
+        fi
+    fi
+    echo "GIN: type=${NCCL_GIN_TYPE} sym_kernels=${NCCL_SYM_GIN_KERNELS_ENABLE:-default}" \
+         "hca=${NCCL_IB_HCA:-unpinned} (nnodes=${NNODES}, devices: ${efa} rdmap + ${other} other)"
+}
+
+# Refuse to launch onto GPUs somebody else is already holding.
+#
+# Cost of not having this, measured 2026-09-05 on B300-3: a leftover
+# kimi-k3-decode container was loading its own 700B checkpoint when this kit
+# launched Hy4 on the same 8 GPUs. Neither launcher noticed, both kept
+# allocating, and ~60 s later BOTH died -- Hy4 with `torch.OutOfMemoryError:
+# GPU 0 has a total capacity of 267.68 GiB of which 613.94 MiB is free`, which
+# reads like a mem-fraction problem in THIS server and sends you tuning
+# --mem-fraction-static instead of looking at `docker ps`. The tell is the
+# arithmetic: the message also said "this process has 9.91 GiB in use", so 257
+# GiB belonged to someone else.
+#
+# Threshold is 1 GiB rather than 0: a few hundred MiB of driver/ECC accounting
+# is normal on an idle B300 and is not a tenant.
+require_free_gpus() {
+    local gpu_list="$1" busy=0 idx used
+    for idx in ${gpu_list//,/ }; do
+        used=$(nvidia-smi --id="$idx" --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null || echo 0)
+        if (( ${used:-0} > 1024 )); then
+            echo "ERROR: GPU $idx already holds ${used} MiB." >&2
+            busy=1
+        fi
+    done
+    if (( busy )); then
+        echo "       Another tenant is on the GPUs this launch wants; starting anyway" >&2
+        echo "       makes both processes die of CUDA OOM a minute from now." >&2
+        echo "       Who has them:" >&2
+        docker ps --format '         container {{.Names}}  {{.Status}}' >&2
+        nvidia-smi --query-compute-apps=pid,used_memory,process_name --format=csv >&2
+        echo "       Then either stop that tenant, or pick free GPUs:" >&2
+        echo "         GPU_LIST=4,5,6,7 TP_SIZE=4 bash $(basename "$0")" >&2
+        echo "       ALLOW_BUSY_GPUS=1 skips this check." >&2
+        exit 1
+    fi
 }
 
 # Host-side gate for the deepep_v2 arm. Unlike require_deepep_image() this is not
-# about a missing library -- the stock image HAS deep_ep -- it is about three
-# source patches. Two of them fail loudly if absent, but the third
-# (mxfp8_act_gran_k on the v2 pre-permute) is a NUMERICS fix: an unpatched image
-# that somehow got past the other two would serve wrong logits, not crash. So the
-# marker is checked, not assumed.
+# about a missing library -- the stock image HAS deep_ep -- it is about four
+# source patches. Two of them fail loudly if absent, but mxfp8_act_gran_k on the
+# v2 pre-permute is a NUMERICS fix: an unpatched image that somehow got past the
+# other two would serve wrong logits, not crash. So the marker is checked, not
+# assumed.
 #
 # Reads a file rather than importing sglang: no --gpus here, and `import sglang`
 # on a GPU-less container is not a reliable probe.
@@ -563,9 +756,49 @@ require_deepep_v2_image() {
         echo "       then: IMAGE=hy4-preview-v2:latest A2A_BACKEND=deepep_v2 ..." >&2
         echo "       Three upstream gates block v2 on HYV4 and one of them is a" >&2
         echo "       numerics bug on MXFP8, so this is not skippable -- see" >&2
-        echo "       patches/README.md. Unpatched alternatives that do work today:" >&2
-        echo "         A2A_BACKEND=deepep            (v1, stock image)" >&2
+        echo "       patches/README.md. The only DeepEP-free alternative:" >&2
         echo "         A2A_BACKEND=none EP_SIZE=$TP_SIZE  (masked EP, no library)" >&2
+        echo "       A2A_BACKEND=deepep is NOT an unpatched alternative -- v1 needs" >&2
+        echo "       hunyuan_v4.diff from this same image." >&2
+        exit 1
+    fi
+}
+
+# Host-side gate for a CROSS-NODE DeepEP arm, v1 or v2. Intra-node, DeepEP moves
+# expert tokens over NVLink and the stock image is enough. Cross-node it has to
+# reach the NIC, and on EFA that path is NCCL GIN -- which needs
+#   * NCCL >= 2.31   (the pip nvidia-nccl-cu13 wheel is the one that gets loaded;
+#                     /usr/lib's libnccl is older and is NOT what torch picks), and
+#   * libnccl-net-ofi.so + libfabric, i.e. the EFA stack.
+# Measured on these images 2026-09-05:
+#   lmsysorg/sglang:hy4-preview  pip NCCL 2.29.7, no OFI plugin, no /opt/amazon/efa
+#   hy4-preview-v2:latest        same (it is that image plus 3 .py patches)
+#   hy4-preview-efa:latest       pip NCCL 2.31.2, libnccl-net-ofi.so, libfabric 2.6.0
+# So the thin v2 image is single-node only, and a 2-node v2 arm needs the v2
+# patches applied ON TOP of the EFA image:
+#   bash 06_build_v2_efa_image.sh
+# Without this gate the failure is not a clean error: NCCL falls back to TCP
+# sockets over ENA, GIN never initializes, and what you get is either a hang at
+# the first MoE layer or a "cross-node" number that is really a socket number.
+require_gin_capable_image() {
+    local img="$1"
+    local ver plugin
+    ver=$(docker run --rm --entrypoint python3 "$img" -c \
+        'import importlib.metadata as m
+try: print(m.version("nvidia-nccl-cu13"))
+except Exception: print("0.0.0")' 2>/dev/null | tr -d '\r')
+    plugin=$(docker run --rm --entrypoint bash "$img" -c \
+        'ls /opt/amazon/ofi-nccl/lib/libnccl-net-ofi.so >/dev/null 2>&1 && echo yes || echo no' 2>/dev/null | tr -d '\r')
+    local major minor
+    major="${ver%%.*}"; minor="$(echo "$ver" | cut -d. -f2)"
+    if (( major < 2 || (major == 2 && minor < 31) )) || [[ "$plugin" != "yes" ]]; then
+        echo "ERROR: image '$img' cannot run DeepEP across nodes on EFA." >&2
+        echo "       pip NCCL = $ver (need >= 2.31), ofi-nccl plugin = $plugin (need yes)." >&2
+        echo "       NCCL GIN is how DeepEP reaches an EFA NIC; without it NCCL drops to" >&2
+        echo "       TCP over ENA and you get a hang or a socket number, not an error." >&2
+        echo "       Build the v2 patches on top of the EFA image:" >&2
+        echo "         bash 05_pull_pd_image.sh && bash 06_build_v2_efa_image.sh" >&2
+        echo "         IMAGE=hy4-preview-v2-efa:latest NNODES=2 ..." >&2
         exit 1
     fi
 }

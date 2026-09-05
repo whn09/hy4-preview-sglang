@@ -1,21 +1,97 @@
-# Hy4-preview + `--moe-a2a-backend deepep_v2`, on the STOCK image.
+# Hy4-preview + `--moe-a2a-backend deepep_v2`.
 #
+#   bash 05_pull_pd_image.sh          # the EFA base, from ECR
 #   docker build -t hy4-preview-v2:latest -f Dockerfile.deepep_v2 .
 #
-# Deliberately thin. The other Dockerfile in this kit swaps NCCL, adds the EFA
-# stack and replaces the Mooncake wheel, all of which a PD run needs and none of
-# which deepep_v2 needs -- and every one of them is a second axis in any
-# v2-vs-v1 comparison. This image changes exactly three Python files and nothing
-# else, so `deepep` on the stock image and `deepep_v2` on this one differ only in
-# the thing under test. Builds in about a minute; no compiler runs.
+# TWO things happen here, and the second one is the one that actually gates v2:
 #
-# The stock image already ships `deep_ep` and `deep_gemm`
-# (/usr/local/lib/python3.12/dist-packages), so there is nothing to install.
+#   1. four source patches (see patches/README.md), and
+#   2. the DeepEP LIBRARY is replaced, because the sglang image does not ship a
+#      v2-capable one.
 #
-# Per-blocker root cause, and why Hy4 needs 3 patches where Kimi-K3 needed 5, is
-# in patches/README.md.
-ARG BASE_IMAGE=lmsysorg/sglang:hy4-preview
+# On (2), measured 2026-09-05: `lmsysorg/sglang:hy4-preview` ships
+# **sgl-deep-ep 0.1.0**, whose package exports `Buffer` and nothing else --
+# `grep -rl ElasticBuffer` finds nothing in the .py files and `strings` finds
+# nothing in `deep_ep_cpp...so`. So v2 does not fail at a gate, it fails at
+# import, ~3 min in, on the FIRST MoE forward of graph capture:
+#
+#   ImportError: DeepEP v2 (ElasticBuffer) is not available. ... cannot import
+#   name 'ElasticBuffer' from 'deep_ep'
+#
+# No patch can fix that. What fixes it is `deep_ep 2.1.0+97d8f9b`, which the
+# Kimi-K3 kit already built for this exact hardware and which sits in
+# `kimi-k3-efa-v2:nccl2312` -- same python 3.12.3, same torch 2.13.0+cu130, same
+# CUDA 13.0.88, so its prebuilt `_C` extension loads unmodified. It exports BOTH
+# `buffers.legacy.Buffer` and `buffers.elastic.ElasticBuffer`, so it serves the
+# v1 arm as well.
+#
+# WHY THE BASE IS THE EFA IMAGE, not the stock one. deep_ep 2.1.0 links NCCL GIN
+# symbols and its own `check_nccl_so()` compares the loaded libnccl against the
+# linked one; GIN needs NCCL >= 2.31 and the stock image has pip
+# nvidia-nccl-cu13 **2.29.7**. So the v2 arm cannot be "the stock image plus
+# patches" under any arrangement -- it needs 2.31.2, which is what the EFA image
+# carries. The consequence for measurement: the v1/none REFERENCE arm must run on
+# this same image too, or the pair differs in NCCL and DeepEP version as well as
+# in backend. Nothing in the four patches or the library swap changes the
+# non-DeepEP path, so that is safe -- but it has to be deliberate.
+#
+# Also note hunyuan_v4.diff is required by v1 `deepep`, not just by v2, so the
+# stock image has no working DeepEP arm of either kind on Hy4.
+#
+# Builds in about a minute; no compiler runs (deep_ep JITs its kernels at first
+# use, and its EP_JIT_CACHE_DIR default is /root/.deep_ep).
+ARG BASE_IMAGE=hy4-preview-efa:latest
+ARG DEEPEP_V2_IMAGE=kimi-k3-efa-v2:nccl2312
+FROM ${DEEPEP_V2_IMAGE} AS deepepv2
 FROM ${BASE_IMAGE}
+
+# ---- DeepEP v1 -> v2 library swap ----
+# Staged through /tmp because COPY --from cannot overwrite a directory that the
+# next layer still needs to delete. The v1 top-level extension `deep_ep_cpp.so`
+# goes too: v2's extension is `deep_ep._C`, nothing imports the old name once the
+# package is replaced, and leaving a stale v1 .so next to a v2 package is how you
+# get an import that half-succeeds.
+COPY --from=deepepv2 /opt/sglang/lib/python3.12/site-packages/deep_ep /tmp/dep/deep_ep
+COPY --from=deepepv2 /opt/sglang/lib/python3.12/site-packages/deep_ep-2.1.0+97d8f9b.dist-info /tmp/dep/deep_ep-2.1.0+97d8f9b.dist-info
+RUN set -eu; \
+    D=/usr/local/lib/python3.12/dist-packages; \
+    rm -rf "$D/deep_ep" "$D/sgl_deep_ep-0.1.0.dist-info" \
+           "$D/deep_ep_cpp.cpython-312-x86_64-linux-gnu.so"; \
+    mv /tmp/dep/deep_ep "$D/deep_ep"; \
+    mv /tmp/dep/deep_ep-2.1.0+97d8f9b.dist-info "$D/"; \
+    rmdir /tmp/dep; \
+    test -f "$D/deep_ep/buffers/elastic.py"; \
+    cd / && python3 -c "import importlib.metadata as m; print('deep_ep', m.version('deep_ep'))"
+
+# ---- the missing cuobjdump ----
+# deep_ep's C++ JIT compiles a kernel and then, to find the mangled symbol to
+# launch, shells out to `$cuda_home/bin/cuobjdump -symbols kernel.cubin`
+# (csrc/jit/kernel_runtime.hpp:24) and asserts the exit code
+# (`kernel_runtime.hpp:33`). Those two -- nvcc and cuobjdump -- are the ONLY
+# things it wants out of cuda_home.
+#
+# This image's CUDA_HOME is `/usr/local/lib/python3.12/dist-packages/nvidia/cu13`,
+# the pip nvcc wheel, which ships nvcc and ptxas but NOT cuobjdump (that is a
+# separate `nvidia-cuda-cuobjdump-cu13` wheel). So on 2026-09-05 every v2 rank
+# compiled its dispatch kernel successfully -- ptxas even reported "Used 42
+# registers" -- and then died on `exit_code == 0` with no other output, ~4 min in,
+# reported as "Capture cuda graph failed". The K3 image is unaffected only because
+# its CUDA_HOME is /usr/local/cuda, the full toolkit.
+#
+# A symlink rather than `ENV CUDA_HOME=/usr/local/cuda`, because one missing
+# binary is the entire delta and repointing the whole toolchain to fix it would
+# also move sglang's own JIT (which builds sm103a modules with the pip nvcc) for
+# no reason. Both were measured and they clear this blocker identically; the
+# symlink is simply the smaller change.
+RUN set -eu; \
+    CH=/usr/local/lib/python3.12/dist-packages/nvidia/cu13; \
+    test -f "$CH/bin/nvcc" || { echo "FATAL: no nvcc at $CH; CUDA_HOME layout moved"; exit 1; }; \
+    if [ ! -f "$CH/bin/cuobjdump" ]; then \
+      test -f /usr/local/cuda/bin/cuobjdump || { echo "FATAL: no cuobjdump to link"; exit 1; }; \
+      ln -s /usr/local/cuda/bin/cuobjdump "$CH/bin/cuobjdump"; \
+      echo "linked cuobjdump into $CH/bin"; \
+    else echo "cuobjdump already present in $CH/bin"; fi; \
+    "$CH/bin/cuobjdump" --version | tail -1
 
 # ---- DeepEP v2 source patches ----
 #   moe_hook.py      HYV4ForCausalLM added to the deepep_v2 model whitelist.
@@ -26,9 +102,24 @@ FROM ${BASE_IMAGE}
 #                    dispatch path, and the v2 pre-permute never set it. Without
 #                    it the gateup GEMM reads a 128-group activation scale as a
 #                    32-group one.
+#   hunyuan_v4.py    get_model_config_for_expert_location() on HYV4ForCausalLM.
+#                    Needed by v1 `deepep` too: the class does not inherit
+#                    DeepseekV2ForCausalLM, so the hook is absent, the global
+#                    expert-location metadata stays None, and every DeepEP arm
+#                    dies on a bare AssertionError during decode graph capture.
 #
 # Applied by TARGET PATH rather than -p<n>, because the diffs are captured
 # against a docker-cp'd copy and no strip level reaches the real tree.
+#
+# `cd /` before locating the tree, and check the result. This is not cosmetic:
+# the stock image has WORKDIR / but hy4-preview-efa has WORKDIR /sgl-workspace,
+# which CONTAINS the repo directory `sglang/` with no __init__.py in it. From
+# there `import sglang` binds the namespace package, `sglang.__file__` is None,
+# and os.path.dirname(None) raises -- so with BASE_IMAGE=hy4-preview-efa the
+# probe used to die before any patch was tried, and buildkit surfaced only the
+# command echo. That looked exactly like "the patches no longer apply", which is
+# a completely different problem. From `/` the import resolves to
+# /sgl-workspace/sglang/python/sglang in both images.
 #
 # The loop is idempotent AND fail-closed. If one of these lands upstream, a plain
 # `patch` would fail and (with `|| true`) leave a half-patched image whose only
@@ -37,7 +128,8 @@ FROM ${BASE_IMAGE}
 # is the intended signal to go check whether the base image moved.
 COPY patches/ /opt/hy4-patches/
 RUN set -eu; \
-    SGL=$(python3 -c "import sglang, os; print(os.path.dirname(sglang.__file__))"); \
+    SGL=$(cd / && python3 -c "import sglang, os; print(os.path.dirname(sglang.__file__))"); \
+    test -d "$SGL/srt" || { echo "FATAL: sglang tree not found (got '$SGL')"; exit 1; }; \
     echo "sglang tree: $SGL"; \
     apply_one() { \
       diff_file="/opt/hy4-patches/$1"; target="$SGL/$2"; \
@@ -56,16 +148,28 @@ RUN set -eu; \
     apply_one moe_hook.diff     srt/arg_groups/moe_hook.py; \
     apply_one fmt_layer.diff    srt/layers/moe/fused_moe_triton/layer.py; \
     apply_one mr_deep_gemm.diff srt/layers/moe/moe_runner/deep_gemm.py; \
-    echo "all three DeepEP v2 patches accounted for"
+    apply_one hunyuan_v4.diff   srt/models/hunyuan_v4.py; \
+    echo "all four DeepEP patches accounted for"
 
 # A launcher-readable marker, so require_deepep_v2_image() can refuse to start a
 # v2 arm on the stock image instead of letting the whitelist error look like a
 # flag typo. Checked by grep, not by importing sglang -- there is no GPU in a
 # build and none is needed to read a file.
 RUN set -eu; \
-    SGL=$(python3 -c "import sglang, os; print(os.path.dirname(sglang.__file__))"); \
+    SGL=$(cd / && python3 -c "import sglang, os; print(os.path.dirname(sglang.__file__))"); \
+    test -d "$SGL/srt" || { echo "FATAL: sglang tree not found (got '$SGL')"; exit 1; }; \
     grep -q HYV4ForCausalLM "$SGL/srt/arg_groups/moe_hook.py"; \
     grep -q "HYV4, MXFP8 on deepep_v2" "$SGL/srt/layers/moe/fused_moe_triton/layer.py"; \
     grep -q "HYV4 MXFP8 on deepep_v2" "$SGL/srt/layers/moe/moe_runner/deep_gemm.py"; \
-    echo hy4-deepep-v2-patched > /etc/hy4-deepep-v2-patched; \
+    grep -q get_model_config_for_expert_location "$SGL/srt/models/hunyuan_v4.py"; \
+    python3 -c "import ast, sys; ast.parse(open(sys.argv[1]).read())" "$SGL/srt/models/hunyuan_v4.py"; \
+    D=/usr/local/lib/python3.12/dist-packages; \
+    grep -q "class ElasticBuffer" "$D/deep_ep/buffers/elastic.py"; \
+    test -x "$D/nvidia/cu13/bin/cuobjdump"; \
+    V=$(python3 -c "import importlib.metadata as m; print(m.version(\"nvidia-nccl-cu13\"))"); \
+    case "$V" in 2.3[1-9]*|2.[4-9][0-9]*|[3-9].*) ;; \
+      *) echo "FATAL: pip NCCL $V < 2.31, DeepEP v2 GIN cannot initialize"; exit 1;; esac; \
+    { echo hy4-deepep-v2-patched; \
+      echo "deep_ep=$(python3 -c "import importlib.metadata as m; print(m.version(\"deep_ep\"))")"; \
+      echo "nccl=$V"; } > /etc/hy4-deepep-v2-patched; \
     cat /etc/hy4-deepep-v2-patched
