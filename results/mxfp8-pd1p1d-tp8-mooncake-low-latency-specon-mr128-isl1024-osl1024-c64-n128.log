@@ -1,0 +1,69 @@
+### tag=mxfp8-pd1p1d-tp8-mooncake-low-latency-specon-mr128-isl1024-osl1024-c64-n128
+### endpoint=localhost:8000 image=hy4-preview-efa:latest
+### quant=mxfp8 tp=8 nnodes=1 profile=low-latency spec=on
+### topo=pd1p1d-tp8-mooncake-mr128 gpus=16 backend=mooncake
+### moe_a2a=none ep=unknown dp_attn=unknown v2_cap=unknown chunk=unknown
+### isl=1024 osl=1024 num_prompts=128 concurrency=64 max_running=128
+### started=2026-09-05T09:52:07Z
+/sgl-workspace/sglang/python/sglang/srt/layers/quantization/awq/awq.py:53: UserWarning: Only CUDA, HIP and XPU support AWQ currently.
+  warnings.warn(f"Only CUDA, HIP and XPU support AWQ currently.")
+/sgl-workspace/sglang/python/sglang/srt/layers/quantization/gguf.py:69: UserWarning: Only CUDA, MUSA and NPU support GGUF quantization currently.
+  warnings.warn(f"Only CUDA, MUSA and NPU support GGUF quantization currently.")
+/sgl-workspace/sglang/python/sglang/bench_serving.py:13: FutureWarning: `sglang.bench_serving` is deprecated and will be removed in a future release; use `sglang.benchmark.serving` instead (e.g. `python -m sglang.benchmark.serving`).
+  warnings.warn(
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+benchmark_args=Namespace(backend='sglang-oai', base_url=None, host='localhost', port=8000, ready_check_timeout_sec=60, dataset_name='random', dataset_path='', dataset_offset=0, agentic_max_turns=None, speed_bench_category=None, speed_bench_output_len=512, model='tencent/Hy4-preview-FP8', served_model_name=None, tokenizer='/models/Hy4-preview-FP8', num_prompts=128, sharegpt_output_len=None, sharegpt_context_len=None, random_input_len=1024, random_output_len=1024, random_range_ratio=1.0, image_count=1, image_resolution='1080p', random_image_count=False, image_format='jpeg', image_content='random', request_rate=inf, use_trace_timestamps=False, max_concurrency=64, output_file='/results/mxfp8-pd1p1d-tp8-mooncake-low-latency-specon-mr128-isl1024-osl1024-c64-n128.json', output_details=False, print_requests=False, disable_tqdm=False, disable_stream=False, return_logprob=False, top_logprobs_num=0, token_ids_logprob=None, logprob_start_len=-1, return_routed_experts=False, cache_report=False, seed=42, disable_ignore_eos=False, temperature=0.0, top_p=1.0, extra_request_body=None, apply_chat_template=False, profile=False, plot_throughput=False, profile_activities=['CPU', 'GPU'], profile_start_step=None, profile_steps=None, profile_num_steps=None, profile_by_stage=False, profile_stages=None, profile_output_dir=None, profile_prefix=None, lora_name=None, lora_request_distribution='uniform', lora_zipf_alpha=1.5, prompt_suffix='', pd_separated=False, profile_prefill_url=None, profile_decode_url=None, flush_cache=True, flush_cache_timeout=60.0, warmup_requests=1, tokenize_prompt=False, gsp_num_groups=64, gsp_prompts_per_group=16, gsp_system_prompt_len=2048, gsp_question_len=128, gsp_output_len=256, gsp_range_ratio=1.0, gsp_fast_prepare=False, gsp_send_routing_key=False, gsp_num_turns=1, gsp_ordered=False, gsp_group_distribution='uniform', gsp_zipf_alpha=None, mooncake_slowdown_factor=1.0, mooncake_num_rounds=1, mooncake_workload='conversation', fake_prefill=False, tag=None, header=None)
+Waiting up to 60s for http://localhost:8000/v1/models to become ready...
+Server ready in 0.0s.
+Namespace(backend='sglang-oai', base_url=None, host='localhost', port=8000, ready_check_timeout_sec=60, dataset_name='random', dataset_path='', dataset_offset=0, agentic_max_turns=None, speed_bench_category=None, speed_bench_output_len=512, model='tencent/Hy4-preview-FP8', served_model_name=None, tokenizer='/models/Hy4-preview-FP8', num_prompts=128, sharegpt_output_len=None, sharegpt_context_len=None, random_input_len=1024, random_output_len=1024, random_range_ratio=1.0, image_count=1, image_resolution='1080p', random_image_count=False, image_format='jpeg', image_content='random', request_rate=inf, use_trace_timestamps=False, max_concurrency=64, output_file='/results/mxfp8-pd1p1d-tp8-mooncake-low-latency-specon-mr128-isl1024-osl1024-c64-n128.json', output_details=False, print_requests=False, disable_tqdm=False, disable_stream=False, return_logprob=False, top_logprobs_num=0, token_ids_logprob=None, logprob_start_len=-1, return_routed_experts=False, cache_report=False, seed=42, disable_ignore_eos=False, temperature=0.0, top_p=1.0, extra_request_body=None, apply_chat_template=False, profile=False, plot_throughput=False, profile_activities=['CPU', 'GPU'], profile_start_step=None, profile_steps=None, profile_num_steps=None, profile_by_stage=False, profile_stages=None, profile_output_dir=None, profile_prefix=None, lora_name=None, lora_request_distribution='uniform', lora_zipf_alpha=1.5, prompt_suffix='', pd_separated=False, profile_prefill_url=None, profile_decode_url=None, flush_cache=True, flush_cache_timeout=60.0, warmup_requests=1, tokenize_prompt=False, gsp_num_groups=64, gsp_prompts_per_group=16, gsp_system_prompt_len=2048, gsp_question_len=128, gsp_output_len=256, gsp_range_ratio=1.0, gsp_fast_prepare=False, gsp_send_routing_key=False, gsp_num_turns=1, gsp_ordered=False, gsp_group_distribution='uniform', gsp_zipf_alpha=None, mooncake_slowdown_factor=1.0, mooncake_num_rounds=1, mooncake_workload='conversation', fake_prefill=False, tag=None, header=None)
+
+#Input tokens: 131072
+#Output tokens: 131072
+Starting warmup with 1 sequences...
+Warmup completed with 1 sequences. Starting main benchmark run...
+  0%|          | 0/128 [00:00<?, ?it/s]  1%|          | 1/128 [00:15<33:09, 15.66s/it]  2%|▏         | 3/128 [00:15<08:41,  4.17s/it]  3%|▎         | 4/128 [00:16<05:54,  2.85s/it]  4%|▍         | 5/128 [00:17<04:31,  2.21s/it]  9%|▉         | 12/128 [00:17<01:01,  1.90it/s] 12%|█▏        | 15/128 [00:17<00:42,  2.65it/s] 14%|█▍        | 18/128 [00:17<00:31,  3.46it/s] 16%|█▌        | 20/128 [00:18<00:29,  3.64it/s] 17%|█▋        | 22/128 [00:18<00:24,  4.36it/s] 21%|██        | 27/128 [00:18<00:14,  7.21it/s] 26%|██▌       | 33/128 [00:18<00:08, 11.60it/s] 31%|███▏      | 40/128 [00:18<00:04, 17.68it/s] 34%|███▍      | 44/128 [00:19<00:04, 18.90it/s] 38%|███▊      | 48/128 [00:19<00:04, 17.75it/s] 40%|███▉      | 51/128 [00:19<00:04, 18.06it/s] 42%|████▏     | 54/128 [00:19<00:04, 16.95it/s] 45%|████▍     | 57/128 [00:20<00:05, 12.15it/s] 46%|████▌     | 59/128 [00:21<00:15,  4.31it/s] 48%|████▊     | 61/128 [00:22<00:15,  4.21it/s] 48%|████▊     | 62/128 [00:22<00:15,  4.36it/s] 50%|█████     | 64/128 [00:29<01:17,  1.20s/it] 51%|█████     | 65/128 [00:30<01:09,  1.10s/it] 52%|█████▏    | 66/128 [00:30<00:57,  1.07it/s] 52%|█████▏    | 67/128 [00:30<00:47,  1.30it/s] 53%|█████▎    | 68/128 [00:31<00:38,  1.55it/s] 54%|█████▍    | 69/128 [00:32<00:44,  1.34it/s] 55%|█████▍    | 70/128 [00:32<00:41,  1.39it/s] 57%|█████▋    | 73/128 [00:33<00:20,  2.71it/s] 59%|█████▊    | 75/128 [00:33<00:13,  3.79it/s] 60%|██████    | 77/128 [00:33<00:10,  5.08it/s] 64%|██████▍   | 82/128 [00:33<00:04,  9.69it/s] 66%|██████▋   | 85/128 [00:34<00:08,  5.26it/s] 68%|██████▊   | 87/128 [00:34<00:07,  5.28it/s] 70%|██████▉   | 89/128 [00:35<00:07,  5.11it/s] 73%|███████▎  | 94/128 [00:35<00:03,  8.78it/s] 78%|███████▊  | 100/128 [00:35<00:01, 14.11it/s] 82%|████████▏ | 105/128 [00:35<00:01, 17.09it/s] 86%|████████▌ | 110/128 [00:35<00:00, 18.82it/s] 88%|████████▊ | 113/128 [00:36<00:01, 13.56it/s] 91%|█████████ | 116/128 [00:36<00:01, 10.74it/s] 92%|█████████▏| 118/128 [00:37<00:00, 10.34it/s] 94%|█████████▍| 120/128 [00:37<00:01,  7.30it/s] 95%|█████████▌| 122/128 [00:38<00:01,  5.68it/s] 96%|█████████▌| 123/128 [00:38<00:00,  5.01it/s] 97%|█████████▋| 124/128 [00:39<00:01,  3.41it/s] 98%|█████████▊| 125/128 [00:39<00:00,  3.47it/s] 98%|█████████▊| 126/128 [00:39<00:00,  3.73it/s]100%|██████████| 128/128 [00:40<00:00,  3.36it/s]100%|██████████| 128/128 [00:40<00:00,  3.16it/s]
+
+============ Serving Benchmark Result ============
+Backend:                                 sglang-oai
+Traffic request rate:                    inf       
+Max request concurrency:                 64        
+Successful requests:                     128       
+Benchmark duration (s):                  40.51     
+Total input tokens:                      131072    
+Total input text tokens:                 131072    
+Total generated tokens:                  131072    
+Total generated tokens (retokenized):    130765    
+Request throughput (req/s):              3.16      
+Input token throughput (tok/s):          3235.87   
+Output token throughput (tok/s):         3235.87   
+Peak output token throughput (tok/s):    1152.00   
+Peak concurrent requests:                89        
+Total token throughput (tok/s):          6471.75   
+Concurrency:                             55.74     
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   17639.23  
+Median E2E Latency (ms):                 17295.53  
+P90 E2E Latency (ms):                    19613.27  
+P95 E2E Latency (ms):                    21449.69  
+P99 E2E Latency (ms):                    22548.07  
+---------------Time to First Token----------------
+Mean TTFT (ms):                          2323.26   
+Median TTFT (ms):                        2102.18   
+P90 TTFT (ms):                           3773.83   
+P95 TTFT (ms):                           3775.26   
+P99 TTFT (ms):                           3822.96   
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          14.97     
+Median TPOT (ms):                        14.53     
+P90 TPOT (ms):                           16.92     
+P95 TPOT (ms):                           18.07     
+P99 TPOT (ms):                           20.26     
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           55.86     
+Median ITL (ms):                         57.68     
+P90 ITL (ms):                            59.50     
+P95 ITL (ms):                            61.11     
+P99 ITL (ms):                            63.57     
+Max ITL (ms):                            354.41    
+==================================================
+### finished=2026-09-05T09:53:23Z rc=0
