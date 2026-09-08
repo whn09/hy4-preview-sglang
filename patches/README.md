@@ -549,6 +549,25 @@ backend), which is why setting the flag on the DeepEP arm only makes the two arm
 The real upstream fix is one of: give `hunyuan_v4.py` a `LayerCommunicator`, or
 force `disable_attn_tp_gather` for architectures that have none. Not filed yet.
 
+**This retracts a throughput row, and the direction it moved is the point.** The TP8
+`deepep` bench taken before the flag existed reported **2711.81 out tok/s at c=64
+against the a2a=none arm's 2324.38 — +16.7%** — because seven eighths of the expert
+work was not being done. A wrong arm that is *faster*, on a healthy server producing
+fluent completions, is exactly the failure a parity gate exists to catch, and no
+amount of reading the log would have caught it. See
+`../results/RETRACTED-nightly-tp8-deepep-pre-atg.md`; the corrected rows carry `atg1`
+in the filename.
+
+**And the corrected row costs almost nothing — but only a control shows that.** The
+fixed arm does 426.06 out tok/s against the graph-on `none` arm's 2324.38, which reads
+as a 5.5x regression until you run `a2a=none --disable-cuda-graph`: **456.33**. So
+DeepEP itself is **−6.6%**, and ~5.1x of the gap is CUDA graph replay in decode. Table,
+axes and the forced-configuration chain (no MXFP8 dispatch on CUDA ⇒ bf16 ⇒ no
+activation scale ⇒ `DEEPEP_MODE=normal`) are in
+`../results/a2a_backends_tp8_c64.md`, published by `gen_a2a_table.py` from each JSON's
+own resolved `server_args`. Open anomaly: the corrected arm reports
+`disable_cuda_graph: False` and still behaves exactly like an eager arm.
+
 ## How far it does get, and what that proves
 
 Worth recording, because each of these was its own blocker and all are now closed:
