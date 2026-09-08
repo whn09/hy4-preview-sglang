@@ -1,0 +1,8 @@
+### model=Qwen3-30B-A3B-FP8 a2a=deepep tp=8 ep=8 layout=compact image=hy4-nightly-deepep:latest
+### deepep_mode=normal
+PROMPT 'The capital of France is'
+  -> ' Paris. The capital of the United Kingdom is London. The capital of the United States is Washington, D.C. The capital of Brazil is Brasília. The'
+PROMPT 'def quicksort(arr):'
+  -> '\n    if len(arr) <= 1:\n        return arr\n    pivot = arr[len(arr) // 2]\n    left = [x for x'
+PROMPT 'In one sentence, why is the sky blue?'
+  -> " The sky appears blue because molecules in the Earth's atmosphere scatter shorter wavelengths of sunlight, like blue and violet, more effectively than longer wavelengths, and our eyes are"

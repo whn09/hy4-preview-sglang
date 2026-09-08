@@ -1,0 +1,56 @@
+=== ref arm: reusing the healthy hy4-parity-ref on :30000
+=== test arm: a2a=deepep tp=4 gpus 4-7 port 30001 atg=1
+WARN: DEEPEP_MODE=normal disables CUDA graph capture for BOTH
+      prefill and decode. Any latency comparison against another
+      arm is then also a graph-on/graph-off comparison.
+hy4-parity-test
+3ac9b248cb53973473741ff0f522d5202398daa3a7cf436af159996f201846a1
+launched 'hy4-parity-test': quant=mxfp8 tp=4 gpus=4,5,6,7 profile=low-latency spec=off image=hy4-nightly-deepep:latest
+  moe   : a2a=deepep ep=4 moe_tp=1 dp_attn=off
+  topo  : parity-test-deepep-tp4
+logs  : docker logs -f hy4-parity-test
+health: curl -s localhost:30001/health_generate
+hy4-parity-ref healthy on :30000
+hy4-parity-test healthy on :30001
+axis                          ref                 test
+--------------------------------------------------------------------
+  moe_a2a_backend             none                deepep
+  ep_size                     4                   4
+  deepep_v2_mode              direct              direct
+  moe_runner_backend          deep_gemm           deep_gemm
+  speculative_moe_a2a_backend None                None
+  disable_attn_tp_gather      False               True
+  chunked_prefill_size        2048                2048
+  tp_size                     4                   4
+  quantization                mxfp8               mxfp8
+  speculative_algorithm       None                None
+  speculative_num_draft_tokens None                None
+  max_running_requests        64                  64
+  page_size                   64                  64
+  kv_cache_dtype              bfloat16            bfloat16
+  enable_dp_attention         False               False
+
+only moe_a2a_backend (and what it forces) differs -- comparison is valid
+
+[1/4] FAIL  DIVERGES at token 22/64
+         top-5: ids DIFFER, max|dlogprob| 0.410244
+         prompt: 'The capital of France is'
+         ref  text: ' ______.\nA. London\nB. Paris\nC. Berlin\nD. Rome 答案：B. Paris例题 4:\n填空题:\nThe ______ of Japan is Tokyo.\n答案: capital例题 5:\n简答题:\n'
+         test text: ' ______.\nA. London\nB. Paris\nC. Berlin\nD. Rome 答案：B。法国的首都是巴黎。本题考查地理常识。A 选项伦敦是英国的首都；C 选项柏林是德国的首都；D 选项罗马是意大利的首都。所以应选 B 选项'
+[2/4] FAIL  DIVERGES at token 26/64
+         top-5: ids same, max|dlogprob| 0.127082
+         prompt: 'Explain in one paragraph why the sky appears blue during'
+         ref  text: '\n\nWe need answer user asks: "Explain in one paragraph why the sky appears blue during the day but red at sunset." Need p'
+         test text: '\n\nWe need answer user asks: "Explain in one paragraph why the sky appears blue during the day but red at sunset." Need o'
+[3/4] PASS  IDENTICAL (64 tokens)
+         top-5: ids same, max|dlogprob| 0.207917
+         prompt: 'def quicksort(arr):\n    if len(arr) <= 1:\n        return'
+[4/4] FAIL  DIVERGES at token 0/64
+         top-5: ids DIFFER, max|dlogprob| 0.164241
+         prompt: 'Translate to Chinese: The quick brown fox jumps over the'
+         ref  text: ' 答案：那只敏捷的棕色狐狸跳过了那只懒狗。\n\n解析：The quick brown fox 是那只敏捷的棕色狐狸，jumps over 是跳过，the lazy dog 是那只懒狗。\nFinal Answer: 那只敏捷的棕色狐狸跳过了那只'
+         test text: '\n\nThe quick brown fox jumps over the lazy dog. -> 那只敏捷的棕色狐狸跳过了那只懒惰的狗。\n\nWait, "quick" can be "快速的" or "敏捷的". "brown" is "'
+
+1/4 prompts produced an identical greedy continuation; worst top-5 |dlogprob| 0.410244 (tol 0.05)
+VERDICT: NO PARITY -- do not quote this arm's throughput. A boot-and-answer
+         server proves nothing here; the contiguous MXFP8 path fails silently.

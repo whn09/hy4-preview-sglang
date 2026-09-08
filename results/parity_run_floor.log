@@ -1,0 +1,30 @@
+=== ref arm: reusing the healthy hy4-parity-ref on :30000
+=== test arm: a2a=none tp=4 gpus 4-7 port 30001 atg=1
+hy4-parity-test
+50be4c5598e0424c77610a2c2f43dbc57e009486cbe9fb03c361070f0bc58f7b
+launched 'hy4-parity-test': quant=mxfp8 tp=4 gpus=4,5,6,7 profile=low-latency spec=off image=hy4-nightly-deepep:latest
+  moe   : a2a=none ep=4 moe_tp=1 dp_attn=off
+  topo  : parity-test-none-tp4
+logs  : docker logs -f hy4-parity-test
+health: curl -s localhost:30001/health_generate
+hy4-parity-ref healthy on :30000
+hy4-parity-test healthy on :30001
+
+FATAL: both servers run the same moe_a2a_backend ('none'); there is nothing to compare.
+axis                          ref                 test
+--------------------------------------------------------------------
+  moe_a2a_backend             none                none
+  ep_size                     4                   4
+  deepep_v2_mode              direct              direct
+  moe_runner_backend          deep_gemm           deep_gemm
+  speculative_moe_a2a_backend None                None
+  disable_attn_tp_gather      False               True
+  chunked_prefill_size        2048                2048
+  tp_size                     4                   4
+  quantization                mxfp8               mxfp8
+  speculative_algorithm       None                None
+  speculative_num_draft_tokens None                None
+  max_running_requests        64                  64
+  page_size                   64                  64
+  kv_cache_dtype              bfloat16            bfloat16
+  enable_dp_attention         False               False

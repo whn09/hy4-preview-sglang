@@ -1,0 +1,26 @@
+hy4-dump-none
+7ec822c48ac905fbd919f6288ca9d322b0d4bab323082fffaaf9cc00bb2ca7d7
+launched 'hy4-dump-none': quant=mxfp8 tp=8 gpus=0,1,2,3,4,5,6,7 profile=low-latency spec=off image=hy4-nightly-deepep-dbg:latest
+  moe   : a2a=none ep=8 moe_tp=1 dp_attn=off
+  topo  : moedump-hy4-none
+logs  : docker logs -f hy4-dump-none
+health: curl -s localhost:30000/health_generate
+[2026-09-08 07:19:42 TP0 EP0] HY4_DBG_MOE_DUMP wrote /tmp/moe_dump-hy4-normal-layer1-rank0.pt (tokens=0 topk=(5, 8) routed_norm=110.107315 in_norm=0.000000)
+[2026-09-08 07:19:42 TP1 EP1] HY4_DBG_MOE_DUMP wrote /tmp/moe_dump-hy4-normal-layer1-rank1.pt (tokens=0 topk=(5, 8) routed_norm=178.164932 in_norm=0.000000)
+[2026-09-08 07:19:42 TP2 EP2] HY4_DBG_MOE_DUMP wrote /tmp/moe_dump-hy4-normal-layer1-rank2.pt (tokens=0 topk=(5, 8) routed_norm=392.036987 in_norm=0.000000)
+[2026-09-08 07:19:42 TP3 EP3] HY4_DBG_MOE_DUMP wrote /tmp/moe_dump-hy4-normal-layer1-rank3.pt (tokens=0 topk=(5, 8) routed_norm=211.979233 in_norm=0.000000)
+[2026-09-08 07:19:42 TP4 EP4] HY4_DBG_MOE_DUMP wrote /tmp/moe_dump-hy4-normal-layer1-rank4.pt (tokens=0 topk=(5, 8) routed_norm=8.955907 in_norm=0.000000)
+[2026-09-08 07:19:42 TP5 EP5] HY4_DBG_MOE_DUMP wrote /tmp/moe_dump-hy4-normal-layer1-rank5.pt (tokens=0 topk=(5, 8) routed_norm=19.481968 in_norm=0.000000)
+[2026-09-08 07:19:42 TP6 EP6] HY4_DBG_MOE_DUMP wrote /tmp/moe_dump-hy4-normal-layer1-rank6.pt (tokens=0 topk=(5, 8) routed_norm=8.287849 in_norm=0.000000)
+[2026-09-08 07:19:42 TP7 EP7] HY4_DBG_MOE_DUMP wrote /tmp/moe_dump-hy4-normal-layer1-rank7.pt (tokens=0 topk=(5, 8) routed_norm=182.373032 in_norm=0.000000)
+total 1000
+drwxrwxr-x 2 ubuntu ubuntu   4096 Sep  8 07:19 .
+drwxrwxr-x 3 ubuntu ubuntu   4096 Sep  8 07:15 ..
+-rw-r--r-- 1 ubuntu ubuntu 125975 Sep  8 07:19 moe_dump-hy4-normal-layer1-rank0.pt
+-rw-r--r-- 1 ubuntu ubuntu 125975 Sep  8 07:19 moe_dump-hy4-normal-layer1-rank1.pt
+-rw-r--r-- 1 ubuntu ubuntu 125975 Sep  8 07:19 moe_dump-hy4-normal-layer1-rank2.pt
+-rw-r--r-- 1 ubuntu ubuntu 125975 Sep  8 07:19 moe_dump-hy4-normal-layer1-rank3.pt
+-rw-r--r-- 1 ubuntu ubuntu 125975 Sep  8 07:19 moe_dump-hy4-normal-layer1-rank4.pt
+-rw-r--r-- 1 ubuntu ubuntu 125975 Sep  8 07:19 moe_dump-hy4-normal-layer1-rank5.pt
+-rw-r--r-- 1 ubuntu ubuntu 125975 Sep  8 07:19 moe_dump-hy4-normal-layer1-rank6.pt
+-rw-r--r-- 1 ubuntu ubuntu 125975 Sep  8 07:19 moe_dump-hy4-normal-layer1-rank7.pt

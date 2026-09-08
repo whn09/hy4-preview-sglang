@@ -1,0 +1,25 @@
+tag=hy4 layer=1   arms: normal:hy4 vs deepep:hy4atg
+
+[normal:hy4] ranks=[0, 1, 2, 3, 4, 5, 6, 7] rows=5
+  input  row norms: 11.0395 11.3238 10.6315 11.3055 10.5215
+  out(sum) row norms: 287.5062 398.5189 162.5184 120.7488 107.0899
+  topk_ids row0: [121, 250, 162, 207, 17, 59, 161, 78]
+  routed_out norm per rank: r0=110.1072  r1=178.1648  r2=392.0360  r3=211.9790  r4=8.9559  r5=19.4819  r6=8.2878  r7=182.3732
+  ranks differ (1/8 match rank0) => per-rank partial, summing for the comparison (pure-EP convention)
+
+[deepep:hy4atg] ranks=[0, 1, 2, 3, 4, 5, 6, 7] rows=5
+  input  row norms: 11.0395 11.3238 10.6315 11.3055 10.5215
+  out(sum) row norms: 813.3854 1127.8583 459.8805 341.7120 303.0347
+  topk_ids row0: [121, 250, 162, 207, 17, 59, 161, 78]
+  routed_out norm per rank: r0=191.7742  r1=191.7742  r2=191.7742  r3=191.7742  r4=191.7742  r5=191.7742  r6=191.7742  r7=191.7742
+  all ranks bit-identical => already combined (DeepEP convention)
+
+input     : rel_l2=0.000e+00  max_abs=0.000e+00
+topk_ids  : identical=True
+topk_wts  : rel_l2=0.000e+00  sum=5.000000 vs 5.000000
+routed_out: rel_l2=6.463e-01  (partial vs combined)  norm=542.160156 vs 191.774185
+            per-token rel: min=6.462e-01 median=6.463e-01 max=6.464e-01
+            norm ratio B/A per token: 0.3536 0.3538 0.3537 0.3537 0.3537
+            ratio is CONSTANT to 3.6e-04 => a pure scale of 0.35372 (1/2.8271), not a numerics difference
+
+VERDICT: same input, same routing, and routed output differing by a CONSTANT 0.35372 (1/2.8271). Check that against the config's routed_scaling_factor -- if it matches, the expert path agrees and the two arms merely apply that scale on opposite sides of this dump point. Residual after dividing it out: rel_l2=2.914e-03.

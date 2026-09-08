@@ -1,0 +1,37 @@
+WARN: DEEPEP_MODE=normal disables CUDA graph capture for BOTH
+      prefill and decode. Any latency comparison against another
+      arm is then also a graph-on/graph-off comparison.
+018fa4fcff7987ad589f5171e6e96a837fa6eab2b33535f7a93e151dc479b635
+launched 'hy4-dump-deepep': quant=mxfp8 tp=8 gpus=0,1,2,3,4,5,6,7 profile=low-latency spec=off image=hy4-nightly-deepep-dbg:latest
+  moe   : a2a=deepep ep=8 moe_tp=1 dp_attn=off
+  topo  : moedump-hy4-deepep
+logs  : docker logs -f hy4-dump-deepep
+health: curl -s localhost:30000/health_generate
+[2026-09-08 07:38:52 TP0 EP0] HY4_DBG_MOE_DUMP wrote /tmp/moe_dump-hy4-deepep-layer1-rank0.pt (tokens=8 topk=(8, 8) routed_norm=101.641342 in_norm=30.937733)
+[2026-09-08 07:38:52 TP1 EP1] HY4_DBG_MOE_DUMP wrote /tmp/moe_dump-hy4-deepep-layer1-rank1.pt (tokens=8 topk=(8, 8) routed_norm=101.641342 in_norm=30.937733)
+[2026-09-08 07:38:52 TP2 EP2] HY4_DBG_MOE_DUMP wrote /tmp/moe_dump-hy4-deepep-layer1-rank2.pt (tokens=8 topk=(8, 8) routed_norm=101.641342 in_norm=30.937733)
+[2026-09-08 07:38:52 TP3 EP3] HY4_DBG_MOE_DUMP wrote /tmp/moe_dump-hy4-deepep-layer1-rank3.pt (tokens=8 topk=(8, 8) routed_norm=101.641342 in_norm=30.937733)
+[2026-09-08 07:38:52 TP4 EP4] HY4_DBG_MOE_DUMP wrote /tmp/moe_dump-hy4-deepep-layer1-rank4.pt (tokens=8 topk=(8, 8) routed_norm=101.641342 in_norm=30.937733)
+[2026-09-08 07:38:52 TP5 EP5] HY4_DBG_MOE_DUMP wrote /tmp/moe_dump-hy4-deepep-layer1-rank5.pt (tokens=8 topk=(8, 8) routed_norm=0.000000 in_norm=30.937733)
+[2026-09-08 07:38:52 TP6 EP6] HY4_DBG_MOE_DUMP wrote /tmp/moe_dump-hy4-deepep-layer1-rank6.pt (tokens=8 topk=(8, 8) routed_norm=0.000000 in_norm=30.937733)
+[2026-09-08 07:38:52 TP7 EP7] HY4_DBG_MOE_DUMP wrote /tmp/moe_dump-hy4-deepep-layer1-rank7.pt (tokens=8 topk=(8, 8) routed_norm=0.000000 in_norm=30.937733)
+total 5064
+drwxrwxr-x 2 ubuntu ubuntu   4096 Sep  8 07:38 .
+drwxrwxr-x 3 ubuntu ubuntu   4096 Sep  8 07:35 ..
+-rw-r--r-- 1 ubuntu ubuntu 396567 Sep  8 07:38 moe_dump-hy4-deepep-layer1-rank0.pt
+-rw-r--r-- 1 ubuntu ubuntu 396567 Sep  8 07:38 moe_dump-hy4-deepep-layer1-rank1.pt
+-rw-r--r-- 1 ubuntu ubuntu 396567 Sep  8 07:38 moe_dump-hy4-deepep-layer1-rank2.pt
+-rw-r--r-- 1 ubuntu ubuntu 396567 Sep  8 07:38 moe_dump-hy4-deepep-layer1-rank3.pt
+-rw-r--r-- 1 ubuntu ubuntu 396567 Sep  8 07:38 moe_dump-hy4-deepep-layer1-rank4.pt
+-rw-r--r-- 1 ubuntu ubuntu 396567 Sep  8 07:38 moe_dump-hy4-deepep-layer1-rank5.pt
+-rw-r--r-- 1 ubuntu ubuntu 396567 Sep  8 07:38 moe_dump-hy4-deepep-layer1-rank6.pt
+-rw-r--r-- 1 ubuntu ubuntu 396567 Sep  8 07:38 moe_dump-hy4-deepep-layer1-rank7.pt
+-rw-r--r-- 1 ubuntu ubuntu 248855 Sep  8 07:27 moe_dump-hy4-normal-layer1-rank0.pt
+-rw-r--r-- 1 ubuntu ubuntu 248855 Sep  8 07:27 moe_dump-hy4-normal-layer1-rank1.pt
+-rw-r--r-- 1 ubuntu ubuntu 248855 Sep  8 07:27 moe_dump-hy4-normal-layer1-rank2.pt
+-rw-r--r-- 1 ubuntu ubuntu 248855 Sep  8 07:27 moe_dump-hy4-normal-layer1-rank3.pt
+-rw-r--r-- 1 ubuntu ubuntu 248855 Sep  8 07:27 moe_dump-hy4-normal-layer1-rank4.pt
+-rw-r--r-- 1 ubuntu ubuntu 248855 Sep  8 07:27 moe_dump-hy4-normal-layer1-rank5.pt
+-rw-r--r-- 1 ubuntu ubuntu 248855 Sep  8 07:27 moe_dump-hy4-normal-layer1-rank6.pt
+-rw-r--r-- 1 ubuntu ubuntu 248855 Sep  8 07:27 moe_dump-hy4-normal-layer1-rank7.pt
+hy4-dump-deepep

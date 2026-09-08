@@ -1,37 +1,57 @@
-# Hy4-preview (HYV4) on DeepEP — four patches **and a library swap**
+# Hy4-preview (HYV4) on DeepEP — six patches, and which base image you need
 
-Base image: **`hy4-preview-efa:latest`**, not the stock `lmsysorg/sglang:hy4-preview`.
-That is a requirement, not a preference — see "Blocker 7" below. sglang `0.5.18`,
-python 3.12.
+There are two supported bases, and they are not interchangeable:
 
-Two independent things are wrong on the stock image, and only one of them is a
-patch:
+| base | Dockerfile | image | what it can run |
+|---|---|---|---|
+| `hy4-preview-efa:latest` | `Dockerfile.deepep_v2` | `hy4-preview-v2:latest` | v1 `deepep` **and** `deepep_v2` (NCCL 2.31.2 ⇒ GIN), and PD over EFA |
+| `lmsysorg/sglang:nightly-dev-cu13-*` | `Dockerfile.nightly_deepep` | `hy4-nightly-deepep:latest` | v1 `deepep` only — the nightly's NCCL is **2.30.7**, below GIN's 2.31 floor |
 
-* **four source patches**, listed below. Patch 4 is needed by v1 `deepep` as well
-  as by v2, so on the stock image *no* DeepEP arm on Hy4 reaches a served token.
-  The other three do nothing unless `moe_a2a_backend == deepep_v2`.
+The nightly base exists because HYV4 merged upstream on 2026-09-05 (PR #36805,
+merge commit `55bf338`), which raised the obvious question of whether we still
+need our own images. Partly. See **"Does the upstream nightly replace our
+images?"** at the end — the short answer is that it replaces the *stock* image for
+plain single-node serving, cannot do `deepep_v2` (NCCL), and cannot do PD
+(mooncake without libfabric), so `hy4-preview-efa` is still required.
+
+Two independent things are wrong on the stock `lmsysorg/sglang:hy4-preview`
+image, and only one of them is a patch:
+
+* **six source patches**, listed below. Patches 4, 5 and 6 are needed by v1
+  `deepep` (6 *only* by v1), so without them *no* DeepEP arm on Hy4 reaches a
+  served token. The other three do nothing unless
+  `moe_a2a_backend == deepep_v2`.
 * **the DeepEP library itself is v1-only** (`sgl-deep-ep 0.1.0`, no
   `ElasticBuffer`). No patch can fix that; `Dockerfile.deepep_v2` replaces the
   package with `deep_ep 2.1.0+97d8f9b` out of `kimi-k3-efa-v2:nccl2312`. That
-  library needs NCCL ≥ 2.31, which is why the base must be the EFA image.
+  library needs NCCL ≥ 2.31, which is why the v2 base must be the EFA image. The
+  nightly needs no swap — it already ships `deep_ep 2.1.0` **with**
+  `ElasticBuffer` under the distribution name `sgl-deep-ep 0.1.2`.
 
 Build and run:
 
 ```bash
+# deepep_v2, on the EFA base
 docker build -t hy4-preview-v2:latest -f Dockerfile.deepep_v2 .
 IMAGE=hy4-preview-v2:latest A2A_BACKEND=deepep_v2 CHUNKED_PREFILL=2048 \
   MEM_FRACTION=0.92 bash 10_launch_standalone.sh
+
+# v1 deepep, on the upstream nightly
+docker build -t hy4-nightly-deepep:latest -f Dockerfile.nightly_deepep \
+  --build-arg BASE_IMAGE=lmsysorg/sglang:nightly-dev-cu13-20260908-20ca564b .
+IMAGE=hy4-nightly-deepep:latest A2A_BACKEND=deepep MEM_FRACTION=0.85 \
+  MAX_RUNNING=128 bash 10_launch_standalone.sh
 ```
 
 `MEM_FRACTION` is there because the ElasticBuffer is memory the `none` arm never
 pays for — see "Not blockers" below.
 
-`CHUNKED_PREFILL` is not optional on this backend and the default would refuse to
-boot — see "Capacity" below.
+`CHUNKED_PREFILL` is not optional on the v2 backend and the default would refuse
+to boot — see "Capacity" below.
 
 The diffs are marked `LOCAL EXPERIMENT ONLY`. **Passing a gate is not a
-correctness proof** — and here that warning has teeth, because blockers 3 and 4
-are bugs, not gates.
+correctness proof** — and here that warning has teeth, because blockers 3 to 6 are
+bugs, not gates.
 
 | # | file | what | kind | affects |
 |---|---|---|---|---|
@@ -39,21 +59,20 @@ are bugs, not gates.
 | 2 | `fmt_layer.diff` | the quant gate rejects MXFP8 outright | validation | v2 |
 | 3 | `mr_deep_gemm.diff` | MXFP8 activation granularity never set on the v2 path | **real bug** | v2 |
 | 4 | `hunyuan_v4.diff` | `get_model_config_for_expert_location` missing on HYV4 | **real bug** | v2 **and v1** |
+| 5 | `silu_group32.diff` | clamped-swiglu post-quant only instantiable at `kGroupSize=128` | **missing kernel** | v2 **and v1** |
+| 6 | `mr_dg_normal.diff` | patch 3's bug again, one function up: the **v1 normal** pre-permute sets no granularity either | **real bug** | **v1** |
 
-Three more blockers are *not* patches:
+One more blocker is *not* a patch: the speculative draft inherits the a2a backend,
+and the escape hatch is an env flag (`--speculative-moe-a2a-backend`, handled by
+`env_common.sh`). It is described under "The other two" below.
 
-* **5** is an env flag — `--speculative-moe-a2a-backend`, handled by `env_common.sh`.
-* **6+7** are one missing kernel, and they are where both DeepEP arms currently
-  stop. See **"The wall"** below. Nothing in this directory fixes that, and
-  nothing can: clamped-swiglu post-quant is unimplemented at `group_size 32`,
-  which is Hy4's MXFP8 block shape.
+Numbering note, because the old numbering is quoted in commit messages and in
+`../results/deepep_v2_enablement/`: what used to be **blockers 6 and 7** — "the
+wall", one missing kernel with two faces — is now **patch 5**, and the defect it
+was hiding is now **patch 6**. Both diagnostic sections are kept below, because the
+diagnosis is the justification for each patch.
 
-So as of 2026-09-05 these patches are necessary but **not sufficient** on the
-MXFP8 checkpoint. They are still worth keeping: they close every blocker up to the
-kernel, so a fixed kernel is the only thing standing between this kit and a
-working v2 arm.
-
-## Why four, when Kimi-K3 needed five
+## Why six, when Kimi-K3 needed five (a different five)
 
 `../../kimi-k3-sglang/patches/README.md` lists five blockers for K3 on the same
 backend. Three of those five **do not apply to Hy4**, and each was checked against
@@ -351,21 +370,184 @@ But it guards only `_should_use_masked_standard_layout()`, i.e. the **standard**
 v2 masked runner never consults it, and "fall back to compact" is not available
 there anyway — the masked layout is how v2 dispatch delivers tokens.
 
-**What would actually unblock it** (either one, both real work):
+Two things would unblock it, and only one of them is honest:
 
 1. instantiate the DSV4 CUDA kernel at `kGroupSize=32` — plumb the template
    parameter into the two device kernels instead of the `128u` constants; or
 2. add a plain-silu-plus-clamp branch to the Triton kernel, independent of
    `GEMM1_ALPHA`.
 
-Either way, gate the result on `96_logprob_parity.py` against
-`A2A_BACKEND=none EP_SIZE=8` before quoting a number — the whole hazard here is an
-activation that runs and is wrong.
+Option 1 is **patch 5** (`silu_group32.diff`), described next. Option 2 remains
+unattempted and is the worse of the two: it would put Hy4's activation on a
+different implementation from every other quantisation of it.
 
-**The one untested combination that might sidestep it:** BF16 weights with v1
-`deepep`. No FP8 post-quant means this kernel is never reached. v2 is not an
-option there (the quant gate rejects non-FP8 on its first branch, before anything
-these patches touch).
+**The one untested combination that sidesteps the kernel entirely:** BF16 weights
+with v1 `deepep`. No FP8 post-quant means this kernel is never reached. v2 is not
+an option there (the quant gate rejects non-FP8 on its first branch, before
+anything these patches touch).
+
+## Blocker 5 — generalising the kernel to group 32 (`silu_group32.diff`)
+
+Cut against `kernels/jit/csrc/deepseek_v4/silu_and_mul_masked_post_quant.cuh` at
+sglang `main` @ `20ca564b` (md5 `e213889ee590876d6cc12585ef9bed6a`, byte-identical
+to the copy inside `nightly-dev-cu13-20260908-20ca564b`, so the diff is cut against
+exactly what the nightly runs). 91 lines, eight edits, **no change to launch
+configuration**.
+
+The kernel already had `kGroupSize` as a template parameter — it was simply never
+used. Each device kernel shadowed it with a local `constexpr uint32_t kGroupSize =
+128u` and each host wrapper asserted the parameter equalled 128. So the fix is to
+delete the shadowing constants and let the parameter through:
+
+| edit | where | x |
+|---|---|---|
+| add `uint32_t kGroupSize` as the first template parameter | varlen `:112`, contig `:398` | 2 |
+| delete `constexpr uint32_t kGroupSize = 128u;`, derive `kWorkThreads = kGroupSize / 8u` | both device kernels | 2 |
+| `static_assert(8 * kWorkThreads == 128)` → `== kGroupSize` | both device kernels | 2 |
+| `static_assert(kGroupSize == 128)` → `kGroupSize == 32 \|\| kGroupSize == 128`, and forward `kGroupSize` into both `kernel_normal` / `kernel_transposed` instantiations | both host wrappers `:263`, `:486` | 2 |
+
+Why the geometry survives, which is the whole reason this is a small diff:
+
+* the tiling is **8 output elements per thread**, so a group needs
+  `kGroupSize / 8` threads: 16 at 128, **4** at 32.
+* the per-group max is `warp::reduce_max<kWorkThreads>`, and `warp.cuh:45`'s
+  `reduce<>` only requires `kNumThreads` be a power of two and ≤ 32
+  (`static_assert` at `:47-48`). Width 4 segments the warp into 8 groups; the
+  `__shfl_xor_sync` loop at `:86` is already width-generic. Nothing in that file
+  assumes 16.
+* the launch is `num_threads = hidden_dim / 8` **regardless of group size** — the
+  group size only changes how that thread block is *partitioned*
+  (`work_id = threadIdx.x / kWorkThreads`), not how many threads there are. So
+  grid, block, smem and occupancy are unchanged; only `num_groups` changes, from
+  `6144/128 = 48` to `6144/32 = 192`.
+* the transposed scale layout requires `num_groups % 4 == 0`; `192 % 4 == 0`.
+
+So this is a generalisation of an already-correct kernel, not a second
+implementation of it — which is what makes it worth proposing upstream, and what
+distinguishes it from option 2 above.
+
+`silu_group32.diff` is wired into **`Dockerfile.nightly_deepep`** only.
+`Dockerfile.deepep_v2`'s base (`hy4-preview-efa`) is an older sglang whose copy of
+this header differs, and its apply loop is fail-closed, so adding an
+un-re-cut diff there would break a working build. Re-cut it against that base
+before enabling v2 with group 32.
+
+**Validation status: see "Validating" below.** A kernel that compiles is the
+easiest half; the hazard patch 3 documents — an activation that runs and is
+wrong — applies to this patch with full force, so nothing from this arm is
+quotable until first-token top-5 logprobs match an `A2A_BACKEND=none EP_SIZE=8`
+reference on the same image.
+
+## Blocker 6 — the v1 normal pre-permute sets no granularity either (`mr_dg_normal.diff`)
+
+Found by fixing blocker 5: with the group-32 kernel in place the v1 `deepep` arm
+stops advancing at the **gateup** GEMM instead, one step *earlier* in the MoE
+forward than "the wall" was. Measured on B300-1, 2026-09-08,
+`hy4-nightly-deepep` at TP8/EP8/MXFP8, during prefill graph capture:
+
+```
+srt/layers/moe/moe_runner/deep_gemm.py:431 in _run_contiguous_gemm
+deep_gemm/__init__.py:174 m_grouped_fp8_fp4_gemm_nt_contiguous
+RuntimeError: Assertion error (.../utils/layout.hpp:108):
+  sf.size(-1) == ceil_div(k, gran_k * (sf_dtype == torch::kFloat ? 1 : 4))
+```
+
+This is **blocker 3 again, in the sibling function**, and the arithmetic is the
+same as the one in patch 3's comment with the two sides swapped:
+
+| | value |
+|---|---|
+| what `pre_permute_deepep_normal_to_deep_gemm` (`:1344`) actually builds | `ceil_div(K // 128, 4)` = `ceil_div(6144 // 128, 4)` = **12** lanes, and it calls `ep_scatter` at its default `quant_block_size=128` — the 128 is hard-coded four times in that function and never reads `block_shape` |
+| what the runner then demands | `recipe_a = (1, gran_k_act)` with `gran_k_act` falling back to `block_shape[1]` = 32 ⇒ `ceil_div(6144, 32*4)` = **48** |
+
+So the key is missing on exactly the paths that hard-code 128:
+`pre_permute_deepep_ll_to_deep_gemm` sets it (`:1300`, with a comment saying
+why), `pre_permute_standard_to_deep_gemm` sets it in both its branches (it
+quantises at `block_shape[1]`, so `block_shape[1]` is right there), and the two
+DeepEP paths that use a fixed 128 group — **normal** and **v2** — set nothing.
+Patch 3 hunk A fixes v2; this patch fixes normal. One line each, mirroring
+DeepEP-LL.
+
+Note what this says about the old diagnosis: on the 2026-09-05 stock image the v1
+arm failed at `silu_and_mul_clamp` with `CUDA error: invalid argument`, which read
+like the same missing kernel as v2's static_assert. It was **two** defects
+stacked, and the group-32 one was merely the louder. With the kernel fixed the
+gateup GEMM gets to run at all, and then reports its own scale-shape mismatch
+properly.
+
+`mr_dg_normal.diff` is cut against the file **after** `mr_deep_gemm.diff`, so the
+Dockerfile applies it second. It is wired into `Dockerfile.nightly_deepep` only:
+the EFA base is an older sglang whose `pre_permute_deepep_normal_to_deep_gemm`
+does set the key (at what was then `:1071`), so it needs checking, not this diff.
+
+## Blocker 7 — the gate throws away 7 of 8 tokens (`--disable-attn-tp-gather`)
+
+This is the one that made every DeepEP arm on Hy4 *wrong* rather than dead, and it
+is **not a patch and not ours** — it is an integration gap in the upstream
+`hunyuan_v4.py`, worked around by one server flag
+(`DISABLE_ATTN_TP_GATHER=1`, see `start_server.sh`).
+
+With `--moe-a2a-backend deepep*` and DP attention off,
+`require_attn_tp_gather()` (`srt/utils/common.py:3887`) returns True on the
+strength of "the a2a backend is not none" alone. That makes
+`require_gathered_buffer()` True, so the scheduler pads the batch up to a multiple
+of `attn_tp_size` and derives `num_token_non_padded` as this rank's **sequence
+shard**:
+
+```
+tokens_per_rank = padded // attn_tp_size          # forward_batch_info.py:248
+num_token_non_padded = clamp(global - tokens_per_rank*rank, 0, tokens_per_rank)
+```
+
+`DeepseekV2MoE.forward_deepep` (`deepseek_v2.py:1274`) hands that straight to
+`self.topk(...)`, which masks every row at or past it. The contract only holds for
+models whose `LayerCommunicator` gives the MoE the scattered shard — and
+**`hunyuan_v4.py` has no `LayerCommunicator`/`LayerScatterModes` at all** (grep is
+empty). It uses its own `hc_attn_layer`/`hc_mlp_layer` and calls
+`self.mlp(hidden_states, forward_batch)` on the FULL padded width on every rank
+(`:607`). So a full-width batch gets masked with a shard-local count.
+
+Measured 2026-09-08 on B300-1, tp8/ep8, the 5-token prompt `The capital of France
+is` padded to 8 (`98_moe_dump.sh` + `98_moe_dump_cmp.py`):
+
+| | a2a=none reference | a2a=deepep |
+|---|---|---|
+| MoE input rows | 5 | **8** |
+| `topk_ids` | 5 real rows | row 0 real, **rows 1-7 all `-1`** |
+| `topk_weights` | — | rows 0-4 match the reference — the gate scored every token |
+| `routed_out` per rank | all 8 differ (EP partials) | r0-r4 bit-identical `101.641342`, **r5-r7 exactly `0.0`** |
+
+`tokens_per_rank = 8//8 = 1`, so ranks 0-4 computed only row 0 and ranks 5-7 got
+`clamp(5-5,0,1)=0` and returned nothing. Every number above follows from that one
+line; none of it is a quantization or grouped-GEMM effect.
+
+Why Qwen3-30B-A3B did not catch it (`97_a2a_control.sh`): `qwen3_moe.py:349` passes
+the same argument, but Qwen goes through the standard `LayerCommunicator`, so its
+MoE really does receive the shard and the shard-local count is correct. A control
+model can only exercise the glue it shares.
+
+The flag makes `require_attn_tp_gather()` False, and with DP attention off that
+also clears `require_gathered_buffer()`/`require_mlp_sync()`, so the pad and the
+shard split both disappear. Re-dumped with it, against the same reference:
+
+```
+input     : rel_l2=0.000e+00      <- bit-identical
+topk_ids  : identical=True
+topk_wts  : rel_l2=0.000e+00
+routed_out: ratio B/A constant at 0.3536-0.3538
+```
+
+`1/0.35373 = 2.827` = `config.json`'s `routed_scaling_factor`. The reference's
+runner fuses that scale into the expert epilogue; `forward_deepep` applies it after
+`self.experts()` returns, i.e. downstream of the dump point. So the expert path
+itself agrees.
+
+An a2a=none arm is unaffected either way (`require_attn_tp_gather()` tests the a2a
+backend), which is why setting the flag on the DeepEP arm only makes the two arms
+*agree* on a layout instead of adding an axis.
+
+The real upstream fix is one of: give `hunyuan_v4.py` a `LayerCommunicator`, or
+force `disable_attn_tp_gather` for architectures that have none. Not filed yet.
 
 ## How far it does get, and what that proves
 
@@ -381,6 +563,11 @@ Worth recording, because each of these was its own blocker and all are now close
 | the ElasticBuffer builds cross-node, all 16 ranks | `Initialized DeepEP v2 ElasticBuffer: world_size=16 ... allow_hybrid_mode=True num_bytes=570425344` |
 | DeepEP's own dispatch kernel compiles **and loads** | ptxas `Used 42 registers`, and zero `kernel_runtime.hpp:33` asserts after the cuobjdump fix |
 | then, identically at 1 and 2 nodes | the static_assert above |
+| **v1 `deepep` serves, and is numerically right** | on the nightly image with all six patches + blocker 7's flag: MoE boundary dump agrees on input, routing and experts, and the greedy/logprob pair lands **at the noise floor** (below) |
+
+Blocker 7 is what makes that last row possible and it is not v2-specific: it applied
+to every DeepEP arm on this model, silently, and is the reason earlier "the DeepEP
+arm answers fine" runs were not evidence of anything.
 
 So the v2 *plumbing* on Hy4 is proven end-to-end, and — after the privileged fix —
 proven **cross-node on the EFA rails** as well, not merely on NVLink. What is
@@ -443,8 +630,30 @@ The reference is `A2A_BACKEND=none EP_SIZE=8` **on this same image** — not v1
 
 ```bash
 IMAGE=hy4-preview-v2:latest A2A_BACKEND=none EP_SIZE=8 CHUNKED_PREFILL=2048 \
+  SGLANG_DEEPGEMM_STANDARD_LAYOUT=compact \
   bash 10_launch_standalone.sh
 ```
+
+**Pin the layout or the reference is not a control.** Left on `auto`, the standard
+pre-permute picks between the *masked* and *compact* grouped-GEMM layouts by a
+memory budget, while every DeepEP-normal arm always takes the compact path
+(`ep_scatter` + contiguous grouped GEMM). An unpinned a2a=none arm can therefore
+differ from the DeepEP arm in the kernel as well as in the dispatcher — and on this
+model it does, since the masked path is the one that reports
+`masked activation group_size 32, DSV4 JIT kernel requires 128`.
+
+Two more harness traps, both of which produce a silent no-result rather than an error:
+
+* **Instrumentation cannot fire under CUDA graphs.** Prefill graphs are on by
+  default (`'prefill': {'backend': 'breakable'}`), so any file-flag- or
+  env-gated dump (`SGLANG_HY4_DBG_MOE_DUMP`, `98_moe_dump.sh`) needs
+  `DISABLE_CUDA_GRAPH=1`. Without it the hook is captured away and the dump
+  directory just stays empty.
+* **`--privileged` defeats `--gpus "device=..."`** — it bypasses the device cgroup,
+  so a "GPUs 4-7" DeepEP container enumerates all 8 and lands its ranks on 0-3, on
+  top of whatever is already there. `10_launch_standalone.sh` now pins
+  `CUDA_VISIBLE_DEVICES` by hand for exactly this reason; the symptom is an OOM
+  that blames a GPU the arm was never supposed to touch.
 
 Then compare **first-token top-5 logprobs**, not prose. A coherent-looking
 completion is not evidence: blocker 3's contiguous half produces a *plausible*
@@ -454,6 +663,35 @@ refuses to run unless the two servers' resolved args differ only in the backend:
 ```bash
 python3 96_logprob_parity.py --ref B300-4:30000 --test B300-3:30000
 ```
+
+With one node, `99_parity_pair.sh` runs both arms as TP4 on opposite GPU halves
+(correctness only — never quote throughput from two containers sharing a node):
+
+```bash
+bash 99_parity_pair.sh                                  # none vs deepep
+TEST_A2A=none TEST_CG_OFF=1 bash 99_parity_pair.sh       # the noise floor
+```
+
+**Measure the floor before believing a `NO PARITY`.** The 0.05 `--tol` is a number
+someone chose, and on this checkpoint it is unreachable by *any* backend. Measured
+2026-09-08, tp4, MXFP8:
+
+| pair | identical continuations | worst top-5 \|dlogprob\| |
+|---|---|---|
+| none vs deepep, **before** blocker 7's flag | 0/4 | **7.48** |
+| none vs deepep, with `DISABLE_ATTN_TP_GATHER=1` | 1/4 | **0.410** |
+| **floor**: none vs none, same everything | 2/4 | **0.593** |
+
+The floor arm differs only in the two axes a DeepEP arm cannot avoid differing in
+— which GPUs it runs on, and CUDA graphs (`DEEPEP_MODE=normal` disables capture) —
+and it scores *worse* than the DeepEP arm. So after blocker 7 the DeepEP arm is
+indistinguishable from the reference at the resolution this pair can achieve, and
+the remaining `NO PARITY` line is about the tolerance, not the arm. The 7.48 → 0.41
+collapse is the real signal; do not read 0.41 as "still broken".
+
+That also means the 0.05 tol cannot be used to clear a *future* arm on this model
+without re-measuring the floor for that arm's own axes. `--noise-floor` exists to
+make that one command.
 
 ## Re-cutting a diff against a new base image
 
@@ -488,3 +726,48 @@ against a `docker cp`'d copy, so no strip level reaches the real tree. The
 Dockerfile's apply loop is idempotent and fail-closed — forward, else
 already-applied (proved by a reverse dry-run), else **fail the build**. A build
 break here is the intended signal that the base image moved.
+
+## Does the upstream nightly replace our images?
+
+HYV4 merged into sglang `main` on **2026-09-05** (PR #36805 "Support Hy4-preview",
+merge commit `55bf338`), so the question is live. Measured against
+`lmsysorg/sglang:nightly-dev-cu13-20260908-20ca564b` on B300-1, 2026-09-08:
+
+| what our images were built to add | in the nightly? |
+|---|---|
+| `HYV4ForCausalLM` at all | **yes** — registered, 267 models, `hunyuan_v4.py` + `hunyuan_v4_nextn.py` |
+| DeepEP **v2** library (`ElasticBuffer`) | **yes** — `sgl-deep-ep 0.1.2` == `deep_ep 2.1.0`, exports `ElasticBuffer`. The v1→v2 swap `Dockerfile.deepep_v2` performs is unnecessary here. |
+| `cuobjdump` under `CUDA_HOME` | **yes** — `CUDA_HOME=/usr/local/cuda` is the full toolkit, so no symlink and no `kernel_runtime.hpp:33` assert |
+| `ptxas` accepting `sm_103` | **yes** — in both toolchains present (stock 13.0.88 and the pip `nvidia-cuda-nvcc 13.3.73` wheel) |
+| the six patches above | **no**, and all six still apply — see the table at the top |
+| NCCL ≥ 2.31, i.e. GIN, i.e. `deepep_v2` | **NO** — `nvidia-nccl-cu13` is **2.30.7**. deep_ep v2 asserts a GIN type even for a single-node `direct` run, so v2 cannot launch on this image at all. Not patchable. The marker records `v2_gin=no` and `require_deepep_v2_image()` refuses. |
+| Mooncake over **libfabric/EFA**, i.e. PD | **NO** — `mooncake-transfer-engine-cuda13 0.3.13` is the non-libfabric build: `engine.so` links `libibverbs`, and `strings` finds zero `fi_getinfo` and zero `EfaTransport` in every `.so` under `site-packages/mooncake`. Identical to the stock `hy4-preview` image, i.e. a "Mooncake PD run" here is TCP over ENA that never says so. |
+
+So:
+
+* **plain single-node serving, no DeepEP, no PD** — the nightly replaces the stock
+  `lmsysorg/sglang:hy4-preview` image outright. Use it.
+* **v1 `deepep`** — the nightly plus `Dockerfile.nightly_deepep` (six patches, no
+  library swap, ~15 s to build).
+* **`deepep_v2`** — still `hy4-preview-efa` + `Dockerfile.deepep_v2`. The NCCL
+  floor is the blocker and no patch reaches it.
+* **PD (1P1D and up)** — still `hy4-preview-efa`. Nothing about the nightly
+  changed this.
+
+### `--moe-a2a-backend deepep` in the cookbook is not a verified recipe
+
+Worth stating because the flag appears in circulated Hy4 launch commands.
+`docs/src/snippets/configs/tencent/hy4-preview.jsx` at `main` @ `20ca564b` carries
+it **only** as a Playground toggle under `moe.backend.options`:
+
+```js
+{ id: "deepep", label: "DeepEP (EP = TP)", flags: ["--moe-a2a-backend deepep"] }
+```
+
+directly under the file's own comment — "The recipes run the MoE under pure TP
+(deep_gemm runner on MXFP8 — the validated HYV4 path); DeepEP is an
+experimentation override." Every cell marked `verified: true` carries no a2a flag.
+And on unpatched `main` the override cannot serve Hy4 for two independent reasons,
+both above: blocker 4 (a bare `AssertionError` at
+`expert_location_dispatch.py:45`, quant-independent) and, on the MXFP8
+checkpoint, blockers 5 and 6.

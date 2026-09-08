@@ -1,0 +1,100 @@
+--- a/python/sglang/srt/layers/moe/moe_runner/deep_gemm.py
++++ b/python/sglang/srt/layers/moe/moe_runner/deep_gemm.py
+@@ -1368,6 +1368,64 @@
+     hidden_states_device = hidden_states.device
+     hidden_states_dtype = hidden_states.dtype
+ 
++    # LOCAL EXPERIMENT (HYV4 MXFP8 on deepep v1 normal).
++    #
++    # This function fixes the activation quantisation group at 128 in three
++    # places -- the scale buffer's lane count below, ep_scatter's default
++    # quant_block_size, and the mxfp8_act_gran_k the contiguous GEMM reads. On a
++    # DeepSeek-style FP8 checkpoint (block 128) all three agree with the weights.
++    # On HYV4's MXFP8 weights, weight_block_size is [1, 32] and they do not, so
++    # deep_gemm's layout.hpp:108 assert fires -- and it is RIGHT to.
++    #
++    # Do NOT silence that assert by declaring the activation 128-grouped. That
++    # was tried: measured 2026-09-08 on a B300 at TP8/EP8 with MTP on, the arm
++    # serves 2711 tok/s and is numerically broken -- 0/4 prompts matched an
++    # a2a=none reference on the same image, worst top-5 |dlogprob| 7.37, output
++    # degenerate ("the capital of the the Franks and the capital of the Franks
++    # and ..."). The FP8 dispatch really did quantise at 128 and nothing
++    # downstream can undo it. Upstream says as much in the sibling file:
++    # token_dispatcher/deepep.py raises "MXFP8 DeepEP dispatch is supported only
++    # on Ascend A5 in low-latency mode", i.e. there is no MXFP8 dispatch on CUDA.
++    #
++    # So take the other route -- dispatch BF16
++    # (--deepep-dispatcher-output-dtype bf16) and quantise here at the
++    # checkpoint's own group, which is exactly what
++    # pre_permute_standard_to_deep_gemm already does: same kernel, same flags,
++    # same ep_scatter argument, same mxfp8_act_gran_k. Twice the dispatch bytes,
++    # and the only granularity that matches these weights.
++    act_gran_k = (
++        quant_info.block_shape[1]
++        if (quant_info.use_mxfp8 and quant_info.block_shape)
++        else 128
++    )
++    if quant_info.use_mxfp8 and hidden_states.dtype == torch.bfloat16:
++        from sglang.kernels.ops.quantization.fp8_kernel import (
++            sglang_per_token_group_quant_fp8,
++        )
++
++        assert hidden_states_scale is None, (
++            "a BF16 DeepEP dispatch must not carry an activation scale; got one, "
++            "so this is not the payload this branch was written for"
++        )
++        bf16_source = hidden_states
++        hidden_states, hidden_states_scale = sglang_per_token_group_quant_fp8(
++            hidden_states,
++            act_gran_k,
++            column_major_scales=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
++            scale_tma_aligned=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
++            scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
++        )
++        dispose_tensor(bf16_source)
++    elif quant_info.use_mxfp8:
++        raise RuntimeError(
++            f"DeepEP normal dispatch delivered {hidden_states.dtype} for an "
++            f"MXFP8 checkpoint (weight_block_size [1, {act_gran_k}]). The FP8 "
++            "dispatch quantises at a fixed 128 group, which does not match these "
++            "weights: the arm then either trips deep_gemm's layout assert or, if "
++            "that is silenced, serves fluent nonsense. Launch with "
++            "--deepep-dispatcher-output-dtype bf16."
++        )
++
+     running_state["hidden_states_shape"] = hidden_states_shape
+     running_state["hidden_states_device"] = hidden_states_device
+     running_state["hidden_states_dtype"] = hidden_states_dtype
+@@ -1390,13 +1448,13 @@
+     if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+         # TODO check whether need `zeros`
+         input_tensor_scale = torch.zeros(
+-            (ceil_div(K // 128, 4), all_tokens),
++            (ceil_div(K // act_gran_k, 4), all_tokens),
+             device=hidden_states.device,
+             dtype=torch.int,
+         ).transpose(0, 1)
+     else:
+         input_tensor_scale = buffer_init(
+-            (all_tokens, K // 128),
++            (all_tokens, K // act_gran_k),
+             device=hidden_states.device,
+             dtype=torch.float32,
+         )
+@@ -1428,11 +1486,16 @@
+         m_indices,
+         output_index,
+         scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
++        quant_block_size=act_gran_k,
+     )
+     dispose_tensor(hidden_states)
+     if hidden_states_scale is not None:
+         dispose_tensor(hidden_states_scale)
+ 
++    # Whatever group the activation was actually quantised at -- read by
++    # _run_contiguous_gemm's recipe_a, whose default is block_shape[1].
++    running_state["mxfp8_act_gran_k"] = act_gran_k
++
+     running_state["output_index"] = output_index
+ 
+     return DeepGemmRunnerInput(

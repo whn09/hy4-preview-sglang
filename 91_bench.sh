@@ -15,6 +15,25 @@ SRV="${SRV:-hy4-preview}"
 ENDPOINT="${ENDPOINT:-localhost:$PORT}"
 HOST="${ENDPOINT%%:*}"
 BPORT="${ENDPOINT##*:}"
+
+# Fail here rather than let read_cenv fall back, because the fallback is SILENT
+# and every axis below is read through it: with the wrong SRV name a DeepEP arm
+# benchmarks as "tp8x1node ... moe_a2a=none" -- a well-formed log about the wrong
+# configuration, which is worse than no log at all. Measured 2026-09-08: the
+# nightly DeepEP arm runs in a container called hy4-nightly-deepep, and a run
+# left at the default name produced exactly that mislabelled file.
+#
+# Only when the endpoint is local: with a remote ENDPOINT there is genuinely no
+# container here to read, and the header's "unknown" cells are then honest.
+if [[ "$HOST" == "localhost" || "$HOST" == "127.0.0.1" ]] && ! docker inspect "$SRV" >/dev/null 2>&1; then
+    echo "FATAL: no container named '$SRV' on this host, but ENDPOINT is local." >&2
+    echo "       Every axis in the filename comes from that container's env and" >&2
+    echo "       read_cenv falls back silently, so this run would be labelled with" >&2
+    echo "       the wrong topology and backend. Containers here:" >&2
+    docker ps -a --format '         {{.Names}}  ({{.Image}})' >&2
+    echo "       Re-run with SRV=<name>." >&2
+    exit 2
+fi
 ISL="${ISL:-1024}"
 OSL="${OSL:-1024}"
 CONCURRENCY="${CONCURRENCY:-32}"
@@ -74,6 +93,11 @@ RUN_CHUNK="$(read_cenv "$SRV" CHUNKED_PREFILL "${CHUNKED_PREFILL:-}")"
 # is a 48-slot run: report it next to the concurrency it was asked for.
 RUN_MAXRUN="$(read_cenv "$SRV" MAX_RUNNING "${MAX_RUNNING:-}")"
 
+# The bench client runs in the SERVER's image, not the kit's default $IMAGE: the
+# tokenizer and bench_serving then match the build under test, and a nightly-image
+# arm does not silently pull a second 20 GB image just to drive it.
+BENCH_IMAGE="${BENCH_IMAGE:-$(docker inspect -f '{{.Config.Image}}' "$SRV" 2>/dev/null || echo "$IMAGE")}"
+
 RESULTS_DIR="${RESULTS_DIR:-$SCRIPT_DIR_HOST/results}"
 TAG="${TAG:-${RUN_QUANT}-${RUN_TOPO}-${RUN_PROF}-spec${RUN_SPEC}-isl${ISL}-osl${OSL}-c${CONCURRENCY}-n${NUM_PROMPTS}}"
 mkdir -p "$RESULTS_DIR"
@@ -105,7 +129,7 @@ echo "log  : ${LOG}"
 docker run --rm --name "hy4-bench-$$" --net=host \
     -v "$HOST_MODEL_DIR/$MODEL_DIRNAME:$RUN_MPATH:ro" \
     -v "$RESULTS_DIR:/results" \
-    --entrypoint python3 "$IMAGE" \
+    --entrypoint python3 "$BENCH_IMAGE" \
     -m sglang.bench_serving \
     --backend sglang-oai \
     --host "$HOST" --port "$BPORT" \

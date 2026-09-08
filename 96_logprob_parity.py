@@ -62,8 +62,13 @@ MUST_MATCH = [
     "kv_cache_dtype",
     "enable_dp_attention",
 ]
+# disable_attn_tp_gather is reported, not enforced, and it is the one axis where
+# "differs" is correct rather than sloppy: require_attn_tp_gather() is False for
+# an a2a=none arm anyway (utils/common.py:3887 tests the a2a backend), so setting
+# it only on the DeepEP arm makes the two arms agree on the layout instead of
+# adding an axis. See the DISABLE_ATTN_TP_GATHER block in start_server.sh.
 REPORT_ONLY = ["moe_a2a_backend", "ep_size", "deepep_v2_mode", "moe_runner_backend",
-               "speculative_moe_a2a_backend"]
+               "speculative_moe_a2a_backend", "disable_attn_tp_gather"]
 
 
 def post(host, path, payload, timeout=600):
@@ -114,22 +119,112 @@ def first_top5(res):
     return [(t[1], t[0]) for t in top[0]]
 
 
+def server_args(host):
+    """The resolved args, from either /get_server_info shape.
+
+    The EFA-base image (sglang 0.5.18) nests them under "server_args"; the
+    2026-09 nightly flattens them to the top level. Detect by a key that only
+    ever lives in the args, so a future third shape fails loudly here instead of
+    silently comparing two dicts of Nones -- every MUST_MATCH axis would then
+    read None on both sides and the gate would pass by vacuity.
+    """
+    info = get(host, "/get_server_info")
+    if isinstance(info.get("server_args"), dict):
+        return info["server_args"]
+    if "chunked_prefill_size" in info:
+        return info
+    raise SystemExit(f"FATAL: {host}/get_server_info has neither a 'server_args' "
+                     f"dict nor a top-level 'chunked_prefill_size'; keys: "
+                     f"{sorted(info)[:12]}...")
+
+
+def collect(host, tokens):
+    """Everything one arm contributes to the comparison, as plain JSON.
+
+    Split out so the two arms need not be alive at the same time: on a single
+    node they cannot be -- one server owns all 8 GPUs -- and a sequential
+    capture is exactly as valid as a simultaneous one here, because both
+    comparisons are deterministic (temperature 0) and neither reads a clock.
+    """
+    blob = {"host": host, "tokens": tokens,
+            "server_args": server_args(host),
+            "results": [generate(host, p, tokens) for p in PROMPTS]}
+    return blob
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ref", required=True, help="host:port of the TRUSTED arm (e.g. a2a=none)")
-    ap.add_argument("--test", required=True, help="host:port of the arm under test (e.g. deepep_v2)")
+    ap.add_argument("--ref", help="host:port of the TRUSTED arm (e.g. a2a=none)")
+    ap.add_argument("--test", help="host:port of the arm under test (e.g. deepep_v2)")
+    ap.add_argument("--capture", metavar="HOST:PORT",
+                    help="single-arm mode: record this server to --out and exit. "
+                         "Use it twice (relaunching in between) when one node has "
+                         "to host both arms, then --compare the two files.")
+    ap.add_argument("--out", metavar="PATH", help="where --capture writes")
+    ap.add_argument("--compare", nargs=2, metavar=("REF.json", "TEST.json"),
+                    help="compare two --capture files instead of two live servers")
+    ap.add_argument("--noise-floor", action="store_true",
+                    help="allow both arms to run the SAME moe_a2a_backend. For "
+                         "measuring what this pair scores with nothing under test: "
+                         "a DeepEP arm cannot avoid also differing in CUDA graphs "
+                         "(DEEPEP_MODE=normal disables capture) and in which GPUs "
+                         "it runs on, and --tol is a tolerance someone chose, not a "
+                         "measurement of those. Without this number a nonzero "
+                         "|dlogprob| cannot be attributed to the backend.")
     ap.add_argument("--tokens", type=int, default=64, help="greedy continuation length")
     ap.add_argument("--tol", type=float, default=0.05,
                     help="max |delta| in a top-5 logprob to still call it agreement")
     args = ap.parse_args()
 
-    # ---- 1. the two servers must differ in exactly one axis ----
-    try:
-        ref_args = get(args.ref, "/get_server_info")["server_args"]
-        test_args = get(args.test, "/get_server_info")["server_args"]
-    except (urllib.error.URLError, OSError) as e:
-        print(f"FATAL: cannot read /get_server_info: {e}", file=sys.stderr)
+    # ---- 0. resolve the two blobs, live or from disk ----
+    if args.capture:
+        if not args.out:
+            print("FATAL: --capture needs --out PATH", file=sys.stderr)
+            return 2
+        try:
+            blob = collect(args.capture, args.tokens)
+        except (urllib.error.URLError, OSError) as e:
+            print(f"FATAL: cannot reach {args.capture}: {e}", file=sys.stderr)
+            return 2
+        with open(args.out, "w") as f:
+            json.dump(blob, f)
+        sa = blob["server_args"]
+        print(f"captured {args.capture} -> {args.out}  "
+              f"(a2a={sa.get('moe_a2a_backend')} ep={sa.get('ep_size')} "
+              f"tokens={args.tokens}, {len(blob['results'])} prompts)")
+        return 0
+
+    if args.compare:
+        try:
+            ref_blob = json.load(open(args.compare[0]))
+            test_blob = json.load(open(args.compare[1]))
+        except OSError as e:
+            print(f"FATAL: {e}", file=sys.stderr)
+            return 2
+        if ref_blob["tokens"] != test_blob["tokens"]:
+            print(f"FATAL: the two captures used different --tokens "
+                  f"({ref_blob['tokens']} vs {test_blob['tokens']}); recapture.",
+                  file=sys.stderr)
+            return 2
+    elif args.ref and args.test:
+        try:
+            ref_blob = collect(args.ref, args.tokens)
+            test_blob = collect(args.test, args.tokens)
+        except (urllib.error.URLError, OSError) as e:
+            print(f"FATAL: cannot reach a server: {e}", file=sys.stderr)
+            return 2
+    else:
+        print("FATAL: give either --ref and --test, or --capture/--out, "
+              "or --compare REF.json TEST.json", file=sys.stderr)
         return 2
+
+    return compare(ref_blob, test_blob, args.tol, args.noise_floor)
+
+
+def compare(ref_blob, test_blob, tol, noise_floor=False):
+    # ---- 1. the two servers must differ in exactly one axis ----
+    ref_args = ref_blob["server_args"]
+    test_args = test_blob["server_args"]
 
     print("axis                          ref                 test")
     print("-" * 68)
@@ -143,10 +238,16 @@ def main():
             bad.append(k)
         print(f"  {k:<27} {str(r):<19} {str(t)}{flag}")
     if ref_args.get("moe_a2a_backend") == test_args.get("moe_a2a_backend"):
-        print("\nFATAL: both servers run the same moe_a2a_backend "
-              f"({ref_args.get('moe_a2a_backend')!r}); there is nothing to compare.",
-              file=sys.stderr)
-        return 2
+        if not noise_floor:
+            print("\nFATAL: both servers run the same moe_a2a_backend "
+                  f"({ref_args.get('moe_a2a_backend')!r}); there is nothing to compare.",
+                  file=sys.stderr)
+            print("       Pass --noise-floor if that is deliberate (see its help).",
+                  file=sys.stderr)
+            return 2
+        print("\nNOISE FLOOR: same backend on both arms. The numbers below are what "
+              "this pair scores when NOTHING under test differs, so they are the "
+              "floor a real arm has to be judged against -- not a pass/fail.")
     if bad:
         print(f"\nFATAL: {len(bad)} axis/axes differ besides the backend: {', '.join(bad)}.",
               file=sys.stderr)
@@ -158,8 +259,8 @@ def main():
     n_ok = 0
     worst = 0.0
     for i, prompt in enumerate(PROMPTS):
-        r = generate(args.ref, prompt, args.tokens)
-        t = generate(args.test, prompt, args.tokens)
+        r = ref_blob["results"][i]
+        t = test_blob["results"][i]
         ref_ids, test_ids = out_token_ids(r), out_token_ids(t)
 
         if ref_ids == test_ids:
@@ -191,12 +292,25 @@ def main():
             print(f"         test text: {t['text'][:120]!r}")
 
     print(f"\n{n_ok}/{len(PROMPTS)} prompts produced an identical greedy continuation; "
-          f"worst top-5 |dlogprob| {worst:.6f} (tol {args.tol})")
-    if n_ok == len(PROMPTS) and worst <= args.tol:
+          f"worst top-5 |dlogprob| {worst:.6f} (tol {tol})")
+    if noise_floor:
+        # Not a verdict: this run had nothing under test, so the numbers ARE the
+        # floor. Measured 2026-09-08, Hy4-preview MXFP8 tp4 pair (a2a=none both
+        # sides, GPUs 0-3 vs 4-7, graphs on vs off): 2/4 identical, worst 0.593124
+        # -- an order of magnitude above the 0.05 tol. On a model this
+        # near-degenerate the tol is unreachable by ANY backend, so quote an arm
+        # against THIS number, not against the tol.
+        print(f"FLOOR: {n_ok}/{len(PROMPTS)} identical, worst {worst:.6f}. Judge a "
+              f"real arm against this, not against tol={tol}: an arm at or under "
+              "the floor is indistinguishable from the reference here.")
+        return 0
+    if n_ok == len(PROMPTS) and worst <= tol:
         print("VERDICT: PARITY -- this arm's numbers are quotable.")
         return 0
-    print("VERDICT: NO PARITY -- do not quote this arm's throughput. A boot-and-answer\n"
-          "         server proves nothing here; the contiguous MXFP8 path fails silently.")
+    print("VERDICT: NO PARITY vs tol -- but compare against the measured floor before\n"
+          "         concluding the arm is wrong (--noise-floor). A boot-and-answer\n"
+          "         server proves nothing either way; the contiguous MXFP8 path\n"
+          "         fails silently.")
     return 1
 
 

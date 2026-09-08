@@ -1,0 +1,59 @@
+=== ref arm: a2a=none tp=4 gpus 0-3 port 30000
+e31d7e7e9ccb4f31090037b73bb1f874ede21b58fd2ec39038dcda9bf12e0ab4
+launched 'hy4-parity-ref': quant=mxfp8 tp=4 gpus=0,1,2,3 profile=low-latency spec=off image=hy4-nightly-deepep:latest
+  moe   : a2a=none ep=4 moe_tp=1 dp_attn=off
+  topo  : parity-ref-none-tp4
+logs  : docker logs -f hy4-parity-ref
+health: curl -s localhost:30000/health_generate
+=== test arm: a2a=deepep tp=4 gpus 4-7 port 30001 atg=1
+WARN: DEEPEP_MODE=normal disables CUDA graph capture for BOTH
+      prefill and decode. Any latency comparison against another
+      arm is then also a graph-on/graph-off comparison.
+ab037145d6fd84822253462f379f4328da5f6a47ba575d554252b2c7fc7c63ed
+launched 'hy4-parity-test': quant=mxfp8 tp=4 gpus=4,5,6,7 profile=low-latency spec=off image=hy4-nightly-deepep:latest
+  moe   : a2a=deepep ep=4 moe_tp=1 dp_attn=off
+  topo  : parity-test-deepep-tp4
+logs  : docker logs -f hy4-parity-test
+health: curl -s localhost:30001/health_generate
+hy4-parity-ref healthy on :30000
+FATAL: hy4-parity-test died
+  File "/sgl-workspace/sglang/python/sglang/srt/model_executor/model_runner.py", line 1188, in load_model
+    loaded = load_model_with_memory_saver(
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/sgl-workspace/sglang/python/sglang/srt/model_executor/model_runner_components/load_model_utils.py", line 307, in load_model_with_memory_saver
+    model = loader.load_model(
+            ^^^^^^^^^^^^^^^^^^
+  File "/sgl-workspace/sglang/python/sglang/srt/model_loader/loader.py", line 979, in load_model
+    model = _initialize_model(
+            ^^^^^^^^^^^^^^^^^^
+  File "/sgl-workspace/sglang/python/sglang/srt/model_loader/loader.py", line 301, in _initialize_model
+    return model_class(**kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/sgl-workspace/sglang/python/sglang/srt/models/hunyuan_v4.py", line 705, in __init__
+    self.model = HYV4Model(config, quant_config, f"{prefix}.model")
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/sgl-workspace/sglang/python/sglang/srt/models/hunyuan_v4.py", line 632, in __init__
+    HYV4DecoderLayer(
+  File "/sgl-workspace/sglang/python/sglang/srt/models/hunyuan_v4.py", line 557, in __init__
+    self.mlp = DeepseekV2MoE(
+               ^^^^^^^^^^^^^^
+  File "/sgl-workspace/sglang/python/sglang/srt/models/deepseek_v2.py", line 625, in __init__
+    self.experts = get_moe_impl_class(quant_config)(
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/sgl-workspace/sglang/python/sglang/srt/layers/moe/ep_moe/layer.py", line 86, in __init__
+    super().__init__(
+  File "/sgl-workspace/sglang/python/sglang/srt/layers/moe/fused_moe_triton/layer.py", line 502, in __init__
+    self.quant_method.create_weights(
+  File "/sgl-workspace/sglang/python/sglang/srt/layers/quantization/fp8.py", line 1473, in create_weights
+    Fp8MoEMethod.create_fp8_moe_weight_(
+  File "/sgl-workspace/sglang/python/sglang/srt/layers/quantization/fp8.py", line 1361, in create_fp8_moe_weight_
+    scale_init(
+  File "/opt/sglang/lib/python3.12/site-packages/torch/utils/_device.py", line 122, in __torch_function__
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 48.00 MiB. GPU 3 has a total capacity of 267.68 GiB of which 34.12 MiB is free. Including non-PyTorch memory, this process has 76.64 GiB memory in use. Of the allocated memory 74.72 GiB is allocated by PyTorch, and 52.39 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-cuda-alloc-conf)
+
+[2026-09-08 08:15:28] Received sigquit from a child process. It usually means the child failed.
+[2026-09-08 08:15:28] kill_process_tree called: parent_pid=383, include_parent=True, pid=383
+[rank0]:[W908 08:15:28.297944652 CUDACachingAllocator.cpp:3933] memory allocation failed with OOM on device 0 while trying to allocate 805306368 bytes (free: 572653568, total: 287421038592).
+[rank0]:[W908 08:15:28.298322648 CUDACachingAllocator.cpp:3933] memory allocation failed with OOM on device 0 while trying to allocate 805306368 bytes (free: 572653568, total: 287421038592).

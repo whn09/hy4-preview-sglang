@@ -136,6 +136,22 @@ DP_ATTN="${DP_ATTN:-}"            # empty/off => no DP attention
 # It costs GPU MEMORY -- on K3 the buffer ran ~10.5 GiB per 1024 of capacity, so
 # this is the first thing to lower on an OOM, and Hy4's own ceiling is unmeasured.
 V2_CAP="${V2_CAP:-2048}"
+# v1 `deepep` only, and the exact same shape of problem one backend down. The
+# low-latency (decode) half of v1 dispatch has its own per-rank capacity,
+# SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK, which upstream defaults to
+# **128** (environ.py:1135) and asserts <= 1024 (token_dispatcher/deepep.py:398,
+# because internode_ll's FINISHED_SUM_TAG is 1024). Unlike v2's, it is NOT
+# validated at config time -- it is asserted inside the DeepEP library, 5 minutes
+# in, during decode graph capture:
+#   csrc/legacy/buffer.hpp:1483: x.size(0) <= num_max_dispatch_tokens_per_rank
+#   surfaced as "Capture cuda graph failed", whose three suggested fixes
+#   (mem-fraction, cuda-graph-max-bs-decode, disable the graph) name the symptom
+#   and not the cause.
+# The requirement is decode_graph_bs * tokens_per_request, i.e. MAX_RUNNING x 4
+# with MTP on -- 512 at MAX_RUNNING=128, four times the default. So default it
+# from the values actually in play rather than making the caller rediscover the
+# arithmetic, and let V1_CAP override.
+V1_CAP="${V1_CAP:-}"
 N_ROUTED_EXPERTS=256              # config.json n_routed_experts
 MOE_INTERMEDIATE=2048             # config.json moe_intermediate_size
 
@@ -148,13 +164,29 @@ MOE_INTERMEDIATE=2048             # config.json moe_intermediate_size
 # Anything else -- attention backend, quantization, CUDA-graph capture -- is
 # auto-resolved by the runtime for HYV4 and must stay unset.
 PROFILE="${PROFILE:-low-latency}"
+# Whatever the caller ALREADY set, captured before the profile overwrites it. This
+# is not a convenience: 10_launch_standalone.sh passes the resolved value in as
+# `-e SPEC=`, and start_server.sh re-sources this file inside the container, where
+# SPEC_OVERRIDE is not forwarded. Without this capture the container silently
+# re-derives SPEC from PROFILE and the launcher's decision is discarded.
+# Measured 2026-09-08: `SPEC_OVERRIDE=off ... 10_launch_standalone.sh` echoed
+# `spec=off` on the host and the server came up with
+# speculative_algorithm='EAGLE', then died in the MTP draft-extend path -- the
+# same crash the override was meant to avoid, with nothing in the launcher output
+# to suggest the setting had not taken.
+SPEC_IN="${SPEC:-}"
 case "$PROFILE" in
     low-latency)     SPEC=on  ;;
     high-throughput) SPEC=off ;;
     *) echo "ERROR: PROFILE must be low-latency or high-throughput (got '$PROFILE')" >&2; exit 1 ;;
 esac
-# Explicit SPEC= wins over the profile, for a spec-on/spec-off A/B at one profile.
-SPEC="${SPEC_OVERRIDE:-$SPEC}"
+# Explicit SPEC= wins over the profile, for a spec-on/spec-off A/B at one profile;
+# SPEC_OVERRIDE= still wins over both, since that is what the existing runbooks use.
+SPEC="${SPEC_OVERRIDE:-${SPEC_IN:-$SPEC}}"
+case "$SPEC" in
+    on|off) ;;
+    *) echo "ERROR: SPEC must be on or off (got '$SPEC')" >&2; exit 1 ;;
+esac
 
 PORT="${PORT:-30000}"
 
@@ -277,6 +309,32 @@ setup_runtime_env() {
     # running container for the results header.
     if [[ "${A2A_BACKEND:-none}" == "deepep_v2" ]]; then
         export SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK="${V2_CAP}"
+    fi
+
+    # ---- v1 deepep only: the same thing for the low-latency (decode) half ----
+    # See V1_CAP's comment above for why the default is computed. The decode graph
+    # asks for graph_bs x tokens_per_request, where graph_bs is min(cuda-graph
+    # max_bs 512, MAX_RUNNING) and tokens/req is 4 with MTP on and 1 without.
+    if [[ "${A2A_BACKEND:-none}" == "deepep" ]]; then
+        local per_req=1
+        [[ "${SPEC:-off}" == "on" ]] && per_req=4
+        local v1cap="${V1_CAP:-}"
+        if [[ -z "$v1cap" ]]; then
+            local graph_bs="${MAX_RUNNING:-512}"
+            (( graph_bs > 512 )) && graph_bs=512
+            v1cap=$(( graph_bs * per_req ))
+            (( v1cap < 128 )) && v1cap=128
+        fi
+        if (( v1cap > 1024 )); then
+            echo "ERROR: the v1 deepep low-latency dispatch capacity would need" >&2
+            echo "       $v1cap tokens/rank, but DeepEP asserts <= 1024" >&2
+            echo "       (token_dispatcher/deepep.py:398 -- internode_ll's" >&2
+            echo "       FINISHED_SUM_TAG is 1024). Lower MAX_RUNNING to" >&2
+            echo "       <= $(( 1024 / per_req )) or set V1_CAP explicitly." >&2
+            return 1
+        fi
+        export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK="$v1cap"
+        V1_CAP_EFF="$v1cap"
     fi
 
     # ---- PD-only: KV transfer over EFA ----
@@ -530,6 +588,39 @@ build_moe_args() {
                 echo "      arm is then also a graph-on/graph-off comparison." >&2
             fi
         fi
+        # THE wire format of the dispatch, and on an MXFP8 checkpoint it decides
+        # whether the arm is CORRECT -- not how fast it is.
+        #
+        # utils.py:get_deepep_dispatcher_output_dtype() falls through to FP8 for
+        # every GPU model (step 7), and FP8 dispatch quantises at a fixed 128
+        # group. HYV4's weights are weight_block_size [1,32]. The mismatch is
+        # what deep_gemm's layout.hpp:108 assert was reporting; forcing
+        # mxfp8_act_gran_k=128 silences it and the arm then SERVES GARBAGE --
+        # measured 2026-09-08 on B300-1: 0/4 prompts matched the a2a=none
+        # reference, worst top-5 |dlogprob| 7.37, at 2711 tok/s. Upstream says as
+        # much out loud one file over: token_dispatcher/deepep.py:490 raises
+        # "MXFP8 DeepEP dispatch is supported only on Ascend A5 in low-latency
+        # mode", i.e. there is no MXFP8 dispatch on CUDA at all.
+        #
+        # bf16 leaves the hidden states unquantised on the wire, so the runner
+        # quantises them itself at block_shape[1] = 32 like the pure-TP path
+        # does. Twice the dispatch bytes, and the only granularity that matches
+        # these weights. Hence the default HERE is bf16 rather than the runtime's
+        # fp8: an arm that is fast and wrong is not a data point.
+        if [[ "$A2A_BACKEND" == deepep* && "${QUANT:-mxfp8}" == "mxfp8" ]]; then
+            DISPATCH_DTYPE="${DISPATCH_DTYPE:-bf16}"
+        else
+            DISPATCH_DTYPE="${DISPATCH_DTYPE:-auto}"
+        fi
+        if [[ "$DISPATCH_DTYPE" != "auto" ]]; then
+            MOE_ARGS+=(--deepep-dispatcher-output-dtype "$DISPATCH_DTYPE")
+        fi
+        if [[ "$DISPATCH_DTYPE" == "fp8" || ( "$DISPATCH_DTYPE" == "auto" && "${QUANT:-mxfp8}" == "mxfp8" ) ]]; then
+            echo "WARN: DISPATCH_DTYPE=$DISPATCH_DTYPE on an MXFP8 checkpoint dispatches" >&2
+            echo "      FP8 at a 128 group against [1,32] weights. That arm has been" >&2
+            echo "      MEASURED to serve fluent nonsense (96_logprob_parity.py: 0/4)." >&2
+            echo "      Keep it only to reproduce the defect." >&2
+        fi
     fi
     # Pass EP explicitly whenever it is not 1, including when it equals TP: the
     # value in the log line then matches the value in the filename.
@@ -553,6 +644,21 @@ build_moe_args() {
     # sizes the ElasticBuffer, so a cap-512 row and a cap-2048 row must not share a
     # filename.
     [[ "$A2A_BACKEND" == "deepep_v2" ]] && MOE_TAG="${MOE_TAG}cap${V2_CAP}${DEEPEP_V2_MODE:+-$DEEPEP_V2_MODE}"
+    # Only when overridden: the derived default is a function of MAX_RUNNING and
+    # SPEC, both already in the tag, so tagging it unconditionally would repeat
+    # them. An explicit V1_CAP is a real axis (it sizes the LL buffer).
+    [[ "$A2A_BACKEND" == "deepep" && -n "${V1_CAP:-}" ]] && MOE_TAG="${MOE_TAG}cap${V1_CAP}"
+    # The dispatch wire format is an axis of both correctness and bytes moved, so
+    # it is in the filename unconditionally for any DeepEP arm -- a bf16-dispatch
+    # row and an fp8-dispatch row are not the same measurement even when both
+    # produce a number.
+    [[ "$A2A_BACKEND" == deepep* ]] && MOE_TAG="${MOE_TAG}-disp${DISPATCH_DTYPE:-auto}"
+    # The DeepGEMM standard-layout choice is an axis for a2a=none arms: masked and
+    # compact are two different grouped-GEMM implementations, and on MXFP8 they do
+    # not agree. Untagged, a `compact` control would overwrite the masked baseline
+    # it exists to be compared against.
+    [[ -n "${SGLANG_DEEPGEMM_STANDARD_LAYOUT:-}" && "${SGLANG_DEEPGEMM_STANDARD_LAYOUT}" != "auto" ]] \
+        && MOE_TAG="${MOE_TAG}-layout${SGLANG_DEEPGEMM_STANDARD_LAYOUT}"
     # The draft's own a2a backend is an axis too: with MTP on, `none` and `deepep`
     # put the NextN layer's MoE on different code, and only the default is silent.
     [[ "$A2A_BACKEND" == "deepep_v2" && "$SPEC" == "on" && "${SPEC_A2A_BACKEND:-none}" != "none" ]] \
@@ -749,7 +855,8 @@ require_free_gpus() {
 # on a GPU-less container is not a reliable probe.
 require_deepep_v2_image() {
     local img="$1"
-    if ! docker run --rm --entrypoint cat "$img" /etc/hy4-deepep-v2-patched >/dev/null 2>&1; then
+    local marker
+    if ! marker=$(docker run --rm --entrypoint cat "$img" /etc/hy4-deepep-v2-patched 2>/dev/null); then
         echo "ERROR: image '$img' is not the deepep_v2-patched image." >&2
         echo "       Build it (about a minute, no compiler runs):" >&2
         echo "         docker build -t hy4-preview-v2:latest -f Dockerfile.deepep_v2 ." >&2
@@ -760,6 +867,24 @@ require_deepep_v2_image() {
         echo "         A2A_BACKEND=none EP_SIZE=$TP_SIZE  (masked EP, no library)" >&2
         echo "       A2A_BACKEND=deepep is NOT an unpatched alternative -- v1 needs" >&2
         echo "       hunyuan_v4.diff from this same image." >&2
+        exit 1
+    fi
+    # Patched is necessary but not sufficient. Dockerfile.nightly_deepep builds a
+    # correctly-patched image on an upstream nightly whose pip NCCL is 2.30.7, and
+    # deep_ep v2 asserts a GIN type even for a single-node `direct` run
+    # (csrc/kernels/backend/nccl.cu:87) -- GIN needs NCCL >= 2.31. Without this
+    # check that image launches happily and dies ~10 min in with deep_ep text
+    # about "a network configuration issue", which reads like the EFA/gdrdrv
+    # permissions problem (reference_gin_type5_no_strong_signals) and is not.
+    # A marker with no v2_gin= line is the older Dockerfile.deepep_v2 image, whose
+    # NCCL floor is asserted at build time -- treat its silence as yes.
+    if grep -q '^v2_gin=' <<<"$marker" && ! grep -q '^v2_gin=yes$' <<<"$marker"; then
+        echo "ERROR: image '$img' is patched but cannot run deepep_v2: its NCCL is too old" >&2
+        echo "       for GIN, which deep_ep v2 requires even single-node." >&2
+        sed 's/^/         /' <<<"$marker" >&2
+        echo "       Use A2A_BACKEND=deepep (v1 needs no GIN intra-node), or build on a" >&2
+        echo "       base with NCCL >= 2.31:" >&2
+        echo "         docker build -t hy4-preview-v2:latest -f Dockerfile.deepep_v2 ." >&2
         exit 1
     fi
 }

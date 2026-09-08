@@ -75,7 +75,15 @@ docker rm -f "$NAME" 2>/dev/null || true
 #     header CONTENT, so two images sharing a cache dir can read each other's
 #     cubins and a header-only change measures as a no-op).
 PASSTHRU_ARGS=()
-for v in DEEPEP_V2_MODE V2_CAP CUDA_HOME \
+#   SGLANG_DEEPGEMM_STANDARD_LAYOUT : auto|masked|compact. THE knob that makes a
+#     non-DeepEP arm comparable to a DeepEP one at the kernel level. With a2a=none
+#     the standard pre-permute picks the MASKED layout by a memory budget, while
+#     every DeepEP-normal arm goes through the COMPACT (ep_scatter + contiguous
+#     grouped GEMM) path -- so an a2a=none reference is not a control for the
+#     compact path unless it is pinned to `compact` here.
+for v in DEEPEP_V2_MODE V2_CAP V1_CAP DISPATCH_DTYPE CUDA_HOME \
+         SGLANG_DEEPGEMM_STANDARD_LAYOUT SGLANG_HY4_DBG_SCATTER \
+         SGLANG_HY4_DBG_MOE_DUMP \
          NCCL_GIN_TYPE NCCL_IB_HCA NCCL_SYM_GIN_KERNELS_ENABLE \
          NCCL_DEBUG NCCL_DEBUG_SUBSYS \
          EP_JIT_DEBUG EP_JIT_PRINT_COMPILER_COMMAND EP_JIT_CACHE_DIR; do
@@ -124,6 +132,17 @@ done
 PRIV_ARGS=()
 if [[ "$A2A_BACKEND" == deepep* ]]; then
     PRIV_ARGS+=(--privileged)
+    # --privileged DEFEATS --gpus "device=...". Privileged mode bypasses the
+    # device cgroup, so every /dev/nvidia* is visible and the container enumerates
+    # ALL 8 GPUs regardless of the device list -- measured 2026-09-08 on B300-1:
+    # `--privileged --gpus "device=4,5" nvidia-smi -L` lists 8, the same command
+    # without --privileged lists 2. Harmless at TP8 (the list is all of them
+    # anyway), fatal as soon as the node is shared: a TP4 DeepEP arm asked for
+    # GPUs 4-7 put its ranks on physical 0-3 and OOMed on top of the TP4
+    # reference arm already loading there (torch reported "GPU 3 ... 34 MiB free"
+    # while claiming only 76 GiB for itself -- the missing 191 GiB was the OTHER
+    # container). Pin the ordinals by hand, since the cgroup will not.
+    PRIV_ARGS+=(-e "CUDA_VISIBLE_DEVICES=$GPU_LIST")
     # GDRCopy. Absent unless the DKMS module is loaded and /dev/gdrdrv was
     # mknod'd by hand (gdrdrv has no udev rule -- feedback_gdrdrv_after_kernel_upgrade);
     # NCCL falls back without it, so this is an optimization, not a requirement.
@@ -163,6 +182,7 @@ docker run -d --name "$NAME" \
     -e MAX_RUNNING="${MAX_RUNNING:-}" \
     -e CHUNKED_PREFILL="${CHUNKED_PREFILL:-}" \
     -e DISABLE_CUDA_GRAPH="${DISABLE_CUDA_GRAPH:-0}" \
+    -e DISABLE_ATTN_TP_GATHER="${DISABLE_ATTN_TP_GATHER:-0}" \
     -e DISABLE_RADIX="${DISABLE_RADIX:-0}" \
     -e NNODES="$NNODES" -e NODE_RANK="$NODE_RANK" \
     -e DIST_INIT_ADDR="$DIST_INIT_ADDR" -e DIST_INIT_PORT="$DIST_INIT_PORT" \

@@ -1,0 +1,26 @@
+tag=hy4 layer=1   arms: normal:hy4 vs deepep:hy4
+
+[normal:hy4] ranks=[0, 1, 2, 3, 4, 5, 6, 7] rows=5
+  input  row norms: 11.0395 11.3238 10.6315 11.3055 10.5215
+  out(sum) row norms: 287.5062 398.5189 162.5184 120.7488 107.0899
+  topk_ids row0: [121, 250, 162, 207, 17, 59, 161, 78]
+  routed_out norm per rank: r0=110.1072  r1=178.1648  r2=392.0360  r3=211.9790  r4=8.9559  r5=19.4819  r6=8.2878  r7=182.3732
+  ranks differ (1/8 match rank0) => per-rank partial, summing for the comparison (pure-EP convention)
+
+[deepep:hy4] ranks=[0, 1, 2, 3, 4, 5, 6, 7] rows=8
+  input  row norms: 11.0392 11.3244 10.6295 11.3068 10.5207 10.8861 10.8861 10.8861
+  out(sum) row norms: 508.2068 0.0000 0.0000 0.0000 0.0000 0.0000 0.0000 0.0000
+  topk_ids row0: [121, 250, 162, 207, 17, 59, 161, 78]
+  routed_out norm per rank: r0=101.6413  r1=101.6413  r2=101.6413  r3=101.6413  r4=101.6413  r5=0.0000  r6=0.0000  r7=0.0000
+  !! EXACTLY ZERO on ranks [5, 6, 7] -- those ranks contributed nothing at all
+  ranks differ (5/8 match rank0) => per-rank partial, summing for the comparison (pure-EP convention)
+
+rows      : 5 vs 8 -- comparing the leading 5 (the rest is padding)
+input     : rel_l2=2.066e-02  max_abs=3.598e-02
+topk_ids  : identical=False  same_set=False  differing_slots=80.0%
+topk_wts  : rel_l2=1.655e-02  sum=5.000000 vs 5.000000
+routed_out: rel_l2=9.406e-01  (partial vs partial)  norm=542.160156 vs 508.206757
+            per-token rel: min=7.681e-01 median=1.000e+00 max=1.000e+00
+            norm ratio B/A per token: 1.7676 0.0000 0.0000 0.0000 0.0000
+
+VERDICT: the MoE inputs already differ -- fix the harness first (different prompt, batch, or a stolen dump) before reading further.

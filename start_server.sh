@@ -75,6 +75,32 @@ CG_ARGS=();     [[ "${DISABLE_CUDA_GRAPH:-0}" == "1" ]] && CG_ARGS=(--disable-cu
 # Off makes seeded benchmark runs repeatable (no cross-run prefix reuse). Leave it
 # ON for real serving.
 RADIX_ARGS=();  [[ "${DISABLE_RADIX:-0}" == "1" ]] && RADIX_ARGS=(--disable-radix-cache)
+# NOT a tuning knob: a correctness workaround for a DeepEP arm on this model.
+#
+# With --moe-a2a-backend deepep and DP attention off, require_attn_tp_gather()
+# returns True unconditionally (utils/common.py:3887 -- "a2a backend is not none"
+# is the whole test), so the scheduler pads the batch up to a multiple of
+# attn_tp_size and derives num_token_non_padded as this rank's SEQUENCE SHARD:
+# clamp(global - tokens_per_rank*rank, 0, tokens_per_rank) with
+# tokens_per_rank = padded // attn_tp_size (forward_batch_info.py:248-286).
+# That contract only holds for models that hand their MoE the scattered shard --
+# and hunyuan_v4.py contains no LayerCommunicator/LayerScatterModes at all: it
+# uses its own hc_attn_layer/hc_mlp_layer and calls self.mlp(hidden_states,
+# forward_batch) on the FULL padded width on every rank. The DeepseekV2MoE it
+# reuses then masks that full-width batch with a shard-local count.
+#
+# Measured 2026-09-08, tp8/ep8, 5-token prompt padded to 8 (98_moe_dump.sh):
+# tokens_per_rank = 1, so ranks 0-4 computed ONLY row 0 (routed_out bit-identical
+# 101.641342 on all five) and ranks 5-7 got clamp(5-5,0,1)=0 and returned exactly
+# 0.0 -- topk_ids rows 1-7 were all -1 while topk_weights matched the reference,
+# i.e. the gate scored every token and then the mask threw 7 of 8 away. That is
+# the whole logprob-parity failure, not a quantization or grouped-GEMM issue.
+#
+# This flag makes require_attn_tp_gather() return False, which also makes
+# require_gathered_buffer()/require_mlp_sync() False with DP attention off, so
+# there is no pad-to-8 and no shard split: num_token_non_padded stays the global
+# count. Drop it if hunyuan_v4.py ever grows a real LayerCommunicator.
+ATG_ARGS=(); [[ "${DISABLE_ATTN_TP_GATHER:-0}" == "1" ]] && ATG_ARGS=(--disable-attn-tp-gather)
 
 echo "=== Hy4-preview: quant=${QUANT} tp=${TP_SIZE} nodes=${NNODES}/rank${NODE_RANK}" \
      "profile=${PROFILE} spec=${SPEC} ctx=${CONTEXT_LEN:-default}" \
@@ -87,7 +113,8 @@ echo "    moe: a2a=${A2A_BACKEND} ep=${EP_EFF} moe_tp=$(( TP_SIZE / EP_EFF ))" \
      "dp_attn=${DP_ATTN:-off} -> ${MOE_ARGS[*]:-<none, pure TP>}"
 if [[ "$A2A_BACKEND" == deepep* ]]; then
     echo "    gin: NCCL_GIN_TYPE=${NCCL_GIN_TYPE:-unset} NCCL_SYM_GIN_KERNELS_ENABLE=${NCCL_SYM_GIN_KERNELS_ENABLE:-unset}" \
-         "NCCL_IB_HCA=${NCCL_IB_HCA:-unpinned} v2_cap=${SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK:-n/a}"
+         "NCCL_IB_HCA=${NCCL_IB_HCA:-unpinned} v2_cap=${SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK:-n/a}" \
+         "v1_cap=${SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK:-n/a}"
 fi
 if [[ -n "${PD_ROLE:-}" ]]; then
     echo "    MOONCAKE_PROTOCOL=${MOONCAKE_PROTOCOL:-} MC_MAX_CONCURRENT_REG_MR=${MC_MAX_CONCURRENT_REG_MR:-}" \
@@ -117,6 +144,7 @@ exec sglang serve \
     "${CHUNK_ARGS[@]}" \
     "${CG_ARGS[@]}" \
     "${RADIX_ARGS[@]}" \
+    "${ATG_ARGS[@]}" \
     ${MULTINODE_ARGS[@]+"${MULTINODE_ARGS[@]}"} \
     ${PD_ARGS[@]+"${PD_ARGS[@]}"} \
     --host 0.0.0.0 \

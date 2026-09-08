@@ -1,0 +1,75 @@
+hy4-dump-none
+10b380e16a963a2348073ef02743b5af10ebf9f846db23eab7f9d33bf37db35d
+launched 'hy4-dump-none': quant=mxfp8 tp=8 gpus=0,1,2,3,4,5,6,7 profile=low-latency spec=off image=hy4-nightly-deepep-dbg:latest
+  moe   : a2a=none ep=8 moe_tp=1 dp_attn=off
+  topo  : moedump-hy4-none
+logs  : docker logs -f hy4-dump-none
+health: curl -s localhost:30000/health_generate
+[2026-09-08 07:27:25 TP0 EP0] HY4_DBG_MOE_DUMP wrote /tmp/moe_dump-hy4-normal-layer1-rank0.pt (tokens=5 topk=(5, 8) routed_norm=110.107315 in_norm=24.528442)
+[2026-09-08 07:27:25 TP1 EP1] HY4_DBG_MOE_DUMP wrote /tmp/moe_dump-hy4-normal-layer1-rank1.pt (tokens=5 topk=(5, 8) routed_norm=178.164932 in_norm=24.528442)
+[2026-09-08 07:27:25 TP2 EP2] HY4_DBG_MOE_DUMP wrote /tmp/moe_dump-hy4-normal-layer1-rank2.pt (tokens=5 topk=(5, 8) routed_norm=392.036987 in_norm=24.528442)
+[2026-09-08 07:27:25 TP3 EP3] HY4_DBG_MOE_DUMP wrote /tmp/moe_dump-hy4-normal-layer1-rank3.pt (tokens=5 topk=(5, 8) routed_norm=211.979233 in_norm=24.528442)
+[2026-09-08 07:27:25 TP4 EP4] HY4_DBG_MOE_DUMP wrote /tmp/moe_dump-hy4-normal-layer1-rank4.pt (tokens=5 topk=(5, 8) routed_norm=8.955907 in_norm=24.528442)
+[2026-09-08 07:27:25 TP5 EP5] HY4_DBG_MOE_DUMP wrote /tmp/moe_dump-hy4-normal-layer1-rank5.pt (tokens=5 topk=(5, 8) routed_norm=19.481968 in_norm=24.528442)
+[2026-09-08 07:27:25 TP6 EP6] HY4_DBG_MOE_DUMP wrote /tmp/moe_dump-hy4-normal-layer1-rank6.pt (tokens=5 topk=(5, 8) routed_norm=8.287849 in_norm=24.528442)
+[2026-09-08 07:27:25 TP7 EP7] HY4_DBG_MOE_DUMP wrote /tmp/moe_dump-hy4-normal-layer1-rank7.pt (tokens=5 topk=(5, 8) routed_norm=182.373032 in_norm=24.528442)
+total 1960
+drwxrwxr-x 2 ubuntu ubuntu   4096 Sep  8 07:27 .
+drwxrwxr-x 3 ubuntu ubuntu   4096 Sep  8 07:23 ..
+-rw-r--r-- 1 ubuntu ubuntu 248855 Sep  8 07:27 moe_dump-hy4-normal-layer1-rank0.pt
+-rw-r--r-- 1 ubuntu ubuntu 248855 Sep  8 07:27 moe_dump-hy4-normal-layer1-rank1.pt
+-rw-r--r-- 1 ubuntu ubuntu 248855 Sep  8 07:27 moe_dump-hy4-normal-layer1-rank2.pt
+-rw-r--r-- 1 ubuntu ubuntu 248855 Sep  8 07:27 moe_dump-hy4-normal-layer1-rank3.pt
+-rw-r--r-- 1 ubuntu ubuntu 248855 Sep  8 07:27 moe_dump-hy4-normal-layer1-rank4.pt
+-rw-r--r-- 1 ubuntu ubuntu 248855 Sep  8 07:27 moe_dump-hy4-normal-layer1-rank5.pt
+-rw-r--r-- 1 ubuntu ubuntu 248855 Sep  8 07:27 moe_dump-hy4-normal-layer1-rank6.pt
+-rw-r--r-- 1 ubuntu ubuntu 248855 Sep  8 07:27 moe_dump-hy4-normal-layer1-rank7.pt
+hy4-dump-none
+c210b2e1f646ce346890b293bf5586100a65cb3c8b8865f34e6ebc41a288e3f8
+launched 'hy4-dump-deepep': quant=mxfp8 tp=8 gpus=0,1,2,3,4,5,6,7 profile=low-latency spec=off image=hy4-nightly-deepep-dbg:latest
+  moe   : a2a=deepep ep=8 moe_tp=1 dp_attn=off
+  topo  : moedump-hy4-deepep
+logs  : docker logs -f hy4-dump-deepep
+health: curl -s localhost:30000/health_generate
+FATAL: hy4-dump-deepep died
+    final_hidden_states = self.experts(
+                          ^^^^^^^^^^^^^
+  File "/opt/sglang/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1778, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/sglang/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1789, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/sgl-workspace/sglang/python/sglang/srt/layers/moe/ep_moe/layer.py", line 250, in forward
+    return self.forward_impl(hidden_states, topk_output)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/sgl-workspace/sglang/python/sglang/srt/layers/moe/ep_moe/layer.py", line 259, in forward_impl
+    return super().forward_impl(
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/sgl-workspace/sglang/python/sglang/srt/layers/moe/fused_moe_triton/layer.py", line 1570, in forward_impl
+    combine_input = self.run_moe_core(
+                    ^^^^^^^^^^^^^^^^^^
+  File "/sgl-workspace/sglang/python/sglang/srt/layers/moe/ep_moe/layer.py", line 286, in run_moe_core
+    return super().run_moe_core(dispatch_output)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/sgl-workspace/sglang/python/sglang/srt/layers/moe/fused_moe_triton/layer.py", line 1611, in run_moe_core
+    return self.quant_method.apply(
+           ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/sgl-workspace/sglang/python/sglang/srt/layers/quantization/fp8.py", line 2714, in apply
+    return self.runner.run(dispatch_output, quant_info)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/sgl-workspace/sglang/python/sglang/srt/layers/moe/moe_runner/runner.py", line 242, in run
+    runner_output = self.runner_core.run(
+                    ^^^^^^^^^^^^^^^^^^^^^
+  File "/sgl-workspace/sglang/python/sglang/srt/layers/moe/moe_runner/deep_gemm.py", line 353, in run
+    hidden_states = self._run_masked_gemm(
+                    ^^^^^^^^^^^^^^^^^^^^^^
+  File "/sgl-workspace/sglang/python/sglang/srt/layers/moe/moe_runner/deep_gemm.py", line 718, in _run_masked_gemm
+    act_sf_last = hidden_states_scale.shape[-1]
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^
+AttributeError: 'NoneType' object has no attribute 'shape'
+
+[rank0]:[W908 07:31:36.795489184 ProcessGroupNCCL.cpp:1624] Warning: WARNING: destroy_process_group() was not called before program exit, which can leak resources. For more info, please see https://pytorch.org/docs/stable/distributed.html#shutdown (function operator())
+[2026-09-08 07:31:37] No live scheduler processes found; skipping py-spy and CUDA coredump.
+[2026-09-08 07:31:37] kill_process_tree called: parent_pid=382, include_parent=True, pid=382
+hy4-dump-deepep

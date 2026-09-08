@@ -1,0 +1,164 @@
+# Hy4-preview on DeepEP, built on an UPSTREAM NIGHTLY instead of our own base.
+#
+#   docker pull lmsysorg/sglang:nightly-dev-cu13-20260908-20ca564b
+#   docker build -t hy4-nightly-deepep:latest -f Dockerfile.nightly_deepep \
+#     --build-arg BASE_IMAGE=lmsysorg/sglang:nightly-dev-cu13-20260908-20ca564b .
+#
+# WHY THIS FILE EXISTS, when Dockerfile.deepep_v2 already builds a DeepEP image:
+# the question was whether the nightly can replace our hand-built images now that
+# Hy4 support merged upstream (PR #36805, merge commit 55bf338, 2026-09-05).
+# Measured against nightly-dev-cu13-20260908-20ca564b on 2026-09-08, most of what
+# our own image was built to add is now IN the nightly, and the remainder is not:
+#
+#   already there, no longer our problem
+#     * HYV4ForCausalLM registered (267 models, hunyuan_v4.py + hunyuan_v4_nextn.py)
+#     * `sgl-deep-ep 0.1.2` == deep_ep **2.1.0**, and it exports **ElasticBuffer**.
+#       So the whole v1->v2 library swap that Dockerfile.deepep_v2 performs out of
+#       `kimi-k3-efa-v2:nccl2312` is unnecessary here.
+#     * CUDA_HOME=/usr/local/cuda is the FULL toolkit, so `cuobjdump` is present
+#       and deep_ep's C++ JIT does not die on `exit_code == 0` at
+#       kernel_runtime.hpp:33 (reference_deepep_jit_needs_cuobjdump). No symlink.
+#     * ptxas accepts sm_103 in BOTH toolchains present (stock 13.0.88 and the pip
+#       `nvidia-cuda-nvcc 13.3.73` wheel), so the sm_103 ptxas floor is cleared.
+#
+#   still missing, which is what this file adds
+#     * the four HYV4 patches, ALL FOUR of which still apply cleanly to
+#       20ca564b -- including both hunks of mr_deep_gemm.diff. Upstream did adopt
+#       the `mxfp8_act_gran_k` MECHANISM (the key, its default, the masked read at
+#       moe_runner/deep_gemm.py:703, and setters on the standard and DeepEP-LL
+#       paths) but NOT the two places we need it: the contiguous MXFP8 recipe at
+#       :396 still infers recipe_a from the checkpoint's block_shape, and
+#       pre_permute_deepep_v2_to_deep_gemm still sets nothing.
+#     * mr_dg_normal.diff -- NEW here, and the one patch in this file that is a
+#       real enablement rather than a plumbing fix.
+#       pre_permute_deepep_normal_to_deep_gemm (:1344) fixes the activation
+#       quantisation group at 128 in three places (`ceil_div(K // 128, 4)`,
+#       ep_scatter's default quant_block_size, and the mxfp8_act_gran_k the
+#       contiguous GEMM reads), so on [1,32] MXFP8 weights it dies in deep_gemm's
+#       layout.hpp:108 -- 12 lanes carried, 48 demanded. Declaring the activation
+#       128-grouped makes that assert pass and the server then SERVES GARBAGE
+#       (measured: 0/4 prompts vs an a2a=none reference, worst top-5 |dlogprob|
+#       7.37, at 2711 tok/s). This diff instead does what the pure-TP path does:
+#       take a BF16 dispatch and quantise locally at block_shape[1]. So the arm
+#       requires `--deepep-dispatcher-output-dtype bf16`, which env_common.sh now
+#       defaults to for any MXFP8 DeepEP arm; with fp8 dispatch the patch raises
+#       instead of computing. Cut against the file mr_deep_gemm.diff already
+#       patched, so it must be applied AFTER it -- use patches/_cut_mr_dg_normal.py
+#       to re-cut it rather than editing by hand (four coupled constants).
+#     * silu_group32.diff -- NEW here. The group-32 clamped-swiglu kernel still
+#       does not exist upstream: silu_and_mul_masked_post_quant.cuh hard-codes
+#       `kGroupSize = 128u` in both device kernels (:117, :403) and asserts it in
+#       both host wrappers (:263, :486), which is what stops EVERY DeepEP arm on
+#       the MXFP8 checkpoint (weight_block_size [1,32]). See patches/README.md.
+#
+#   NOT there, and not patchable
+#     * pip `nvidia-nccl-cu13` is **2.30.7**. NCCL GIN needs >= 2.31, so this
+#       image can run the v1 `deepep` arm (NVSHMEM, single-node a2a on NVLink) but
+#       NOT deepep_v2, which asserts a GIN type. The marker records `v2_gin=no`
+#       and env_common.sh's require_deepep_v2_image() refuses on it.
+#     * `mooncake-transfer-engine-cuda13 0.3.13` is the NON-libfabric build:
+#       `engine.so` links libibverbs, and `strings` finds zero `fi_getinfo` and
+#       zero `EfaTransport` in every .so under site-packages/mooncake. Identical
+#       to the stock hy4-preview image, i.e. a "Mooncake PD run" on the nightly is
+#       TCP over ENA that never says so. So `hy4-preview-efa` is still required
+#       for PD; the nightly cannot replace it.
+ARG BASE_IMAGE=lmsysorg/sglang:nightly-dev-cu13-20260908-20ca564b
+FROM ${BASE_IMAGE}
+
+# ---- what the nightly must already have, asserted rather than installed ----
+# Fail here, at build time and with the version printed, rather than 4-13 minutes
+# into a run with a symptom that names none of these.
+#
+# Two naming traps in the four lines below, both of which cost a build:
+#   * the DISTRIBUTION is `sgl-deep-ep`; the importable MODULE is `deep_ep` and
+#     carries its own upstream `__version__` (2.1.0). `m.version("deep_ep")`
+#     raises PackageNotFoundError on this image -- it only resolves on
+#     Dockerfile.deepep_v2's, whose dist-info came from a real upstream wheel.
+#   * read the module's `__init__.py`, never `import deep_ep`: prerequisites.py
+#     raises "The NVIDIA driver does not expose a usable CUDA device" and a
+#     docker build has no GPU (reference_docker_build_no_gpu_probes).
+RUN set -eu; \
+    SP=$(python3 -c "import site; print(site.getsitepackages()[0])"); \
+    echo "site-packages: $SP"; \
+    grep -q "class ElasticBuffer" "$SP/deep_ep/buffers/elastic.py" \
+      || { echo "FATAL: deep_ep in this base has no ElasticBuffer; this file assumes"; \
+           echo "       the nightly's own deep_ep 2.1.0. Use Dockerfile.deepep_v2,"; \
+           echo "       which swaps the library in."; exit 1; }; \
+    test -x "$CUDA_HOME/bin/cuobjdump" \
+      || { echo "FATAL: no cuobjdump under CUDA_HOME=$CUDA_HOME; deep_ep's JIT needs it"; exit 1; }; \
+    "$CUDA_HOME/bin/ptxas" --help 2>/dev/null | grep -q sm_103 \
+      || { echo "FATAL: $CUDA_HOME ptxas does not accept sm_103 (b300)"; exit 1; }; \
+    python3 -c "import importlib.metadata as m; \
+      print('sgl-deep-ep', m.version('sgl-deep-ep')); \
+      print('nccl       ', m.version('nvidia-nccl-cu13')); \
+      print('torch      ', m.version('torch'))"
+
+# ---- the five source patches ----
+# Same fail-closed loop as Dockerfile.deepep_v2, and the same reasons for every
+# line of it: apply by TARGET PATH (the diffs are cut against a docker-cp'd copy,
+# so no -p<n> reaches the real tree); `cd /` before importing sglang (WORKDIR is
+# /sgl-workspace, which CONTAINS a package-less `sglang/` directory, so from there
+# `import sglang` binds a namespace package whose __file__ is None); and on a
+# non-applying diff FAIL THE BUILD rather than leave a half-patched image whose
+# only symptom is wrong logits. A break here is the signal that the nightly moved.
+COPY patches/ /opt/hy4-patches/
+RUN set -eu; \
+    SGL=$(cd / && python3 -c "import sglang, os; print(os.path.dirname(sglang.__file__))"); \
+    test -d "$SGL/srt" || { echo "FATAL: sglang tree not found (got '$SGL')"; exit 1; }; \
+    echo "sglang tree: $SGL"; \
+    apply_one() { \
+      diff_file="/opt/hy4-patches/$1"; target="$SGL/$2"; \
+      test -f "$target" || { echo "FATAL: patch target missing: $target"; exit 1; }; \
+      if patch --forward --dry-run "$target" "$diff_file" >/dev/null 2>&1; then \
+        patch --forward "$target" "$diff_file" >/dev/null && echo "  applied  $1 -> $2"; \
+      elif patch --reverse --dry-run "$target" "$diff_file" >/dev/null 2>&1; then \
+        echo "  SKIP     $1 -> $2 (already present in this nightly)"; \
+      else \
+        echo "FATAL: $1 does not apply to $target and is not already applied."; \
+        echo "       The nightly moved. See patches/README.md, re-cut the diff"; \
+        echo "       against this base, or delete it if the upstream PR merged."; \
+        exit 1; \
+      fi; \
+    }; \
+    apply_one moe_hook.diff      srt/arg_groups/moe_hook.py; \
+    apply_one fmt_layer.diff     srt/layers/moe/fused_moe_triton/layer.py; \
+    apply_one mr_deep_gemm.diff  srt/layers/moe/moe_runner/deep_gemm.py; \
+    apply_one mr_dg_normal.diff  srt/layers/moe/moe_runner/deep_gemm.py; \
+    apply_one hunyuan_v4.diff    srt/models/hunyuan_v4.py; \
+    apply_one silu_group32.diff  kernels/jit/csrc/deepseek_v4/silu_and_mul_masked_post_quant.cuh; \
+    echo "all six DeepEP patches accounted for"
+
+# ---- the launcher-readable marker ----
+# Two fields, not one. `hy4-deepep-v2-patched` is what require_deepep_image() and
+# require_deepep_v2_image() look for; `v2_gin=` is what stops a v2 arm from
+# launching on an image whose NCCL cannot bring GIN up, so that failure surfaces
+# here as one line instead of as a deep_ep abort about "a network configuration
+# issue" (csrc/kernels/backend/nccl.cu:101) ten minutes in.
+RUN set -eu; \
+    SGL=$(cd / && python3 -c "import sglang, os; print(os.path.dirname(sglang.__file__))"); \
+    SP=$(python3 -c "import site; print(site.getsitepackages()[0])"); \
+    grep -q HYV4ForCausalLM "$SGL/srt/arg_groups/moe_hook.py"; \
+    grep -q "HYV4, MXFP8 on deepep_v2" "$SGL/srt/layers/moe/fused_moe_triton/layer.py"; \
+    grep -q "HYV4 MXFP8 on deepep_v2" "$SGL/srt/layers/moe/moe_runner/deep_gemm.py"; \
+    grep -q "HYV4 MXFP8 on deepep v1 normal" "$SGL/srt/layers/moe/moe_runner/deep_gemm.py"; \
+    grep -q "quant_block_size=act_gran_k" "$SGL/srt/layers/moe/moe_runner/deep_gemm.py"; \
+    test "$(grep -c '"mxfp8_act_gran_k"\] = 128' "$SGL/srt/layers/moe/moe_runner/deep_gemm.py")" = 2 \
+      || { echo "FATAL: expected exactly 2 hard-coded gran_k=128 setters (DeepEP-LL and"; \
+           echo "       v2, both still 128-grouped). The v1 normal path must set the"; \
+           echo "       checkpoint's own act_gran_k -- forcing 128 there SERVES GARBAGE."; exit 1; }; \
+    grep -q get_model_config_for_expert_location "$SGL/srt/models/hunyuan_v4.py"; \
+    python3 -c "import ast, sys; ast.parse(open(sys.argv[1]).read())" "$SGL/srt/models/hunyuan_v4.py"; \
+    H="$SGL/kernels/jit/csrc/deepseek_v4/silu_and_mul_masked_post_quant.cuh"; \
+    grep -q "kGroupSize == 32 || kGroupSize == 128" "$H"; \
+    test "$(grep -c 'constexpr uint32_t kGroupSize = 128u;' "$H")" = 0 \
+      || { echo "FATAL: a device kernel still hard-codes kGroupSize=128"; exit 1; }; \
+    grep -q "class ElasticBuffer" "$SP/deep_ep/buffers/elastic.py"; \
+    V=$(python3 -c "import importlib.metadata as m; print(m.version(\"nvidia-nccl-cu13\"))"); \
+    case "$V" in 2.3[1-9]*|2.[4-9][0-9]*|[3-9].*) GIN=yes ;; *) GIN=no ;; esac; \
+    { echo hy4-deepep-v2-patched; \
+      echo "deep_ep=$(sed -n "s/^__version__ = .\(.*\).$/\1/p" "$SP/deep_ep/__init__.py")"; \
+      echo "sgl_deep_ep=$(python3 -c "import importlib.metadata as m; print(m.version(\"sgl-deep-ep\"))")"; \
+      echo "nccl=$V"; \
+      echo "v2_gin=$GIN"; \
+      echo "group32_kernel=yes"; } > /etc/hy4-deepep-v2-patched; \
+    cat /etc/hy4-deepep-v2-patched
