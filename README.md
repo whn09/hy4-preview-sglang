@@ -1,7 +1,8 @@
-# Hy4-preview on AWS p6-b300 (SGLang)
+# Hy4-preview on AWS p6-b300 and p5en (SGLang)
 
-Test kit for **Tencent Hy4-preview** (HYV4) on 8x B300 nodes, modelled on the
-`kimi-k3-sglang` kit. Two arms:
+Test kit for **Tencent Hy4-preview** (HYV4), modelled on the `kimi-k3-sglang`
+kit. Everything below is B300 unless a row says p5en; the p5en arm is BF16 and
+**cross-node only**, for the reasons in "p5en (H200)" below.
 
 | arm | hosts | image | status |
 |---|---|---|---|
@@ -9,6 +10,7 @@ Test kit for **Tencent Hy4-preview** (HYV4) on 8x B300 nodes, modelled on the
 | single node, MXFP8 TP4 (`TP_SIZE=4`) | B300-3 | stock `lmsysorg/sglang:hy4-preview` | **measured** (7 points), see below |
 | 1P1D PD disaggregation | B300-1 prefill / B300-2 decode | `hy4-preview-efa:latest` (ECR, see below) | **boots healthy; not yet benchmarked** |
 | EP / DeepEP arms (`EP_SIZE`, `A2A_BACKEND`) | any one B300 | either | **wired and gated; not yet measured** |
+| **2-node BF16 TP16, `a2a=none`** | **P5EN-3 + P5EN-4** | stock `lmsysorg/sglang:hy4-preview` + host EFA stack | **boots and serves**; the only p5en geometry that exists |
 
 **The default TP changed from 4 to 8** for both quantizations. See "TP8, and why it
 is not a guess" below; the seven measured rows further down are the **TP4**
@@ -261,6 +263,7 @@ patches/                  the deepep_v2 diffs + per-blocker root cause (README.m
 95_features_test.py       asserting harness: 12 functional checks
 91_bench.sh               one bench_serving point -> results/<TAG>.log
 92_sweep.sh               concurrency ladder + table
+93_check_efa.sh           HOST, while generating: is cross-node traffic on EFA?
 gen_bench_table.py        results/*.log -> markdown (never transcribe by hand)
 sync.sh                   push scripts / pull results (NEVER --delete)
 ```
@@ -546,6 +549,139 @@ went-over-EFA, so this was checked three ways rather than grepped for once:
   `/sys/class/infiniband/rdmap*/ports/1/hw_counters/`; read them on the **host**,
   before and after, and diff -- they are the only source here that a
   configuration mistake cannot fake.
+
+---
+
+## p5en (H200): one geometry is reachable, and it is not the obvious one
+
+p5en.48xlarge is 8x H200 (143,771 MiB each) + 16 EFA NICs. Three independent
+constraints leave exactly **one** runnable arm on it, and each one eliminates the
+configuration you would otherwise reach for first.
+
+### MXFP8 is out: the checkpoint needs compute capability 100
+
+`layers/quantization/fp8.py` `get_min_capability` returns **100** when
+`use_mxfp8`, and H200 is 90. This is not a gate to loosen -- there is no sm_90
+MXFP8 expert GEMM behind it. So on p5en, `QUANT=bf16` is the only option, which
+means the 758 GiB `Hy4-preview-FP8` download is dead weight on these hosts.
+
+### One node is out: BF16 does not fit, by 330 GiB
+
+| | bytes | GiB |
+|---|---|---|
+| BF16 weights (131 shards, apparent size) | 1,560,018,288,914 | **1453.3** |
+| one node's HBM (8 x 143,771 MiB) | | **1123.2** |
+| shortfall | | **330.1** |
+
+That is before the KV pool, activations and the CUDA-graph pool, so `TP_SIZE=8
+QUANT=bf16` cannot load at any `MEM_FRACTION`. Note the asymmetry with the FP8
+checkpoint, which *would* have fit one node at 758 GiB (94.8 GiB/GPU) -- the
+quantization that fits is the one the GPU cannot run.
+
+`TP_SIZE` must divide `num_attention_heads=64`, so on 8-GPU nodes the legal
+cross-node values are **TP16 (2 nodes)** and **TP32 (4 nodes)**. At TP16:
+
+* weights **90.8 GiB/GPU**; `MEM_FRACTION=0.90` leaves roughly 35 GiB
+* MLA latent KV is `kv_lora_rank + qk_rope_head_dim = 576` halves per layer =
+  **87.75 KiB/token** over 78 layers, and it is replicated across TP ranks rather
+  than sharded, so ~35 GiB is a **~400K token** pool. Arithmetic, not measured.
+
+### Only `A2A_BACKEND=none` is reachable at BF16
+
+Three separate walls, none of them a gate this kit can open:
+
+* `deepep_v2`: `_validate_deepep_v2_quant_method()` rejects anything that is not
+  an `Fp8MoEMethod` *before* `patches/fmt_layer.diff` is ever consulted, and the
+  v2 runner has no kernel behind `UnquantizedFusedMoEMethod`. `env_common.sh:449`
+  refuses the combination rather than letting it fail 10 minutes in.
+* `deepep` (v1) cross-node: v1 cannot reach an EFA NIC at all -- it dies on a late
+  `NVSHMEM_QP_DEPTH` assert. v1's cross-node path is IB-only.
+* `deepep` (v1) with BF16 experts at all: unquantized DeepEP MoE supports only
+  `low_latency` mode, and that mode's unquantized masked runner then refuses with
+  `forward_deepgemm_masked is deprecated`.
+
+So the p5en arm measures **Hy4's TP all-reduce over EFA**, not MoE a2a, and it
+cannot be used to unblock the `deepep_v2` gates (E in `UPSTREAM.md`).
+
+### The trap that makes it look like it works: NCCL silently uses TCP
+
+Measured 2026-09-09 on P5EN-3/4, `A2A_BACKEND=none NNODES=2 TP_SIZE=16
+QUANT=bf16` on stock `lmsysorg/sglang:hy4-preview`:
+
+| | |
+|---|---|
+| aggregate EFA `tx_bytes` delta over 5 s, all 16 NICs | **0** |
+| ENA (`enp71s0`) tx / rx | **157-159 MB/s** each way |
+| decode, `#running-req: 1`, `accept len 4.00` | **53.64 tok/s** = 74.6 ms/step |
+| of which the 43.7B active parameters' weight read (5.5 GiB/GPU at ~4.8 TB/s) | ~1.1 ms |
+
+So **>95% of the step was the TP all-reduce running on TCP**, and nothing failed:
+the server was healthy and the output was correct. The cause is that
+`lmsysorg/sglang:hy4-preview` contains **no `libnccl-net*.so`** -- NCCL cannot
+speak EFA without aws-ofi-nccl, so it picks `NET/Socket`. `--device=/dev/infiniband`
+does not help; it hands device nodes to a stack with no libfabric to drive them.
+
+`a2a=none` needs the plugin **most**, not least: with no dispatch/combine
+collective, 2 all-reduces x 78 layers *are* the entire cross-node traffic. The
+pre-existing `require_gin_capable_image` guard was scoped to `deepep*`, which is
+exactly why this got through.
+
+Fixed in `env_common.sh`'s `build_efa_args`, called by `10_launch_standalone.sh`
+for **every** `NNODES>1` arm. The host already has the whole stack (efa installer
+3.3.0, libfabric 2.6.0, `/opt/amazon/ofi-nccl/lib/libnccl-net-ofi.so`), so it is
+mounted rather than baked into a 49 GB image. Mounting `/opt/amazon` alone is
+**not** enough -- the host's libfabric wants `EFA_1.7` / `IBVERBS_1.18` and the
+image's distro rdma-core is older:
+
+```
+OSError: /lib/x86_64-linux-gnu/libefa.so.1: version `EFA_1.7' not found
+```
+
+so the two rdma-core sonames and the provider directory come along under
+`/host-efa`. An image that ships its own aws-ofi-nccl (the
+`deepep-v2-efa-official:sm90-*` ones pin a libfabric their DeepEP was built
+against) is left alone. `EFA_INJECT=0` opts out and says loudly that the numbers
+are socket numbers.
+
+### Launching it
+
+```bash
+# both hosts, after every boot -- 16 EFA ENIs, same trap as the B300 section below
+bash 04_fix_multinic_routing.sh
+
+# P5EN-3 (rank 0, the only host that binds :$PORT)
+QUANT=bf16 NNODES=2 NODE_RANK=0 TP_SIZE=16 MEM_FRACTION=0.90 \
+  DIST_INIT_ADDR=172.31.29.216 bash 10_launch_standalone.sh
+# P5EN-4 (rank 1) -- same line, NODE_RANK=1, same DIST_INIT_ADDR
+QUANT=bf16 NNODES=2 NODE_RANK=1 TP_SIZE=16 MEM_FRACTION=0.90 \
+  DIST_INIT_ADDR=172.31.29.216 bash 10_launch_standalone.sh
+
+# then, while it is generating, on either host:
+bash 93_check_efa.sh          # reads the NIC counters; exits 1 on TCP fallback
+```
+
+`DIST_INIT_ADDR` is rank 0's **private (ENA)** IP and must be the same string on
+both hosts; it changes on a stop/start, so read it rather than reuse the one above.
+Only rank 0 binds `:$PORT` -- do not wait for "server is fired up" on rank 1.
+
+`93_check_efa.sh` exists because no log answers this question: at
+`NCCL_DEBUG=WARN` the transport is never printed, and at `INFO` you have to know
+to look for `NET/OFI` vs `NET/Socket`. The counters cannot be faked by a
+configuration mistake, which is the same argument the PD section below makes for
+`rdma_write_bytes`.
+
+### Not yet done on p5en
+
+* **No post-fix numbers.** Every p5en figure above is the TCP-fallback run. The
+  ladder to run first is the same 1/16/64/256 at 1k/1k, both profiles, so it can
+  be compared against a B300 TP8 row -- which also does not exist yet.
+* `04_fix_multinic_routing.sh` has only been exercised on p6-b300's 18 EFA ENIs,
+  not p5en's 16. It is written from the ENI inventory rather than a fixed count,
+  but that is untested here.
+* **TP32 on 4 nodes** is legal arithmetic and nothing more; it has not been tried.
+* p5en also served as the CPU/unit-test box for the three upstream PRs -- see
+  `pr_validation/`, which is a different use of the same hardware and does not
+  depend on any of the above.
 
 ---
 
