@@ -14,6 +14,11 @@ images?"** at the end — the short answer is that it replaces the *stock* image
 plain single-node serving, cannot do `deepep_v2` (NCCL), and cannot do PD
 (mooncake without libfabric), so `hy4-preview-efa` is still required.
 
+Which of the blockers below belong upstream — and which are gates we should keep
+local until a v2 arm exists — is triaged in `../UPSTREAM.md`, re-verified against
+`sgl-project/sglang` `main` @ `8ab9982851` (2026-09-09): all of them still
+reproduce there and none is reported yet.
+
 Two independent things are wrong on the stock `lmsysorg/sglang:hy4-preview`
 image, and only one of them is a patch:
 
@@ -547,7 +552,11 @@ backend), which is why setting the flag on the DeepEP arm only makes the two arm
 *agree* on a layout instead of adding an axis.
 
 The real upstream fix is one of: give `hunyuan_v4.py` a `LayerCommunicator`, or
-force `disable_attn_tp_gather` for architectures that have none. Not filed yet.
+force `disable_attn_tp_gather` for architectures that have none. The second has an
+idiomatic channel — `srt/arg_groups/model_overrides/`, 30 files keyed on
+`hf_config.architectures[0]`, and `require_attn_tp_gather`'s own comment already
+describes this class of model as the reason `disable_attn_tp_gather` exists. Not
+filed yet; it is the top item in `../UPSTREAM.md`.
 
 **This retracts a throughput row, and the direction it moved is the point.** The TP8
 `deepep` bench taken before the flag existed reported **2711.81 out tok/s at c=64
