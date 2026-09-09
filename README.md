@@ -101,7 +101,7 @@ in-progress upstream.
 | two p6-b300 | two independent TP8 servers; 1P1D only if you are TPOT-bound | the pair loses on throughput at every measured concurrency (§3) |
 | one **p5en** (8x H200, 143 GB each) | nothing serves | BF16 misses one node by 330 GiB, and MXFP8 needs compute capability 100 (§4) |
 | two p5en | BF16 TP16 with `A2A_BACKEND=none`, and nothing else | three separate walls block every a2a backend at BF16 (§4) |
-| four p5en | TP32 is legal arithmetic and untried | `TP_SIZE` must divide 64 attention heads |
+| four p5en | 1P1D with TP16 per side, or two independent TP16 servers -- both untried; TP32 is legal arithmetic and also untried | four nodes is exactly two BF16 serving units. `TP_SIZE` must divide 64 attention heads, so TP16 and TP32 are the only widths |
 
 Weights first, on every host that will hold a rank:
 
@@ -187,6 +187,70 @@ Mooncake KV transfer needs libfabric in-image regardless of NCCL.
 to look for `NET/OFI` vs `NET/Socket`. The counters cannot be faked by a
 configuration mistake, which is the same argument §3 makes for
 `rdma_write_bytes`.
+
+### Four p5en: 1P1D, two nodes per side
+
+**Untried.** The arithmetic and the launcher plumbing are checked (below); no
+token has been served this way. Read §3's B300 1P1D-vs-2x-solo result first: on
+16 GPUs the pair *lost* to two independent servers by 54.9% at c=256, and the
+p5en equivalent of that control is two independent TP16 servers on the same four
+nodes -- run both or neither.
+
+Note the counting: this kit's "1P1D" means **one prefill instance and one decode
+instance**, and here each instance is two nodes wide. Four p5en is therefore
+exactly 1P1D. A 2P2D in the kit's sense (four instances) would need eight p5en,
+because BF16 does not fit in one node (§4).
+
+```bash
+# image: already on all four p5en; if a host is new, see the ECR route in §4
+ECR_REGION=us-east-2 ECR_REPO=hy4-preview-sglang bash 05_pull_pd_image.sh
+
+# read-only, all four hosts. Prints "single-NIC node, no rule needed" here.
+bash 04_fix_multinic_routing.sh --check
+
+# --- PREFILL instance: P5EN-1 (side rank 0) + P5EN-2 ---
+# P5EN-1
+QUANT=bf16 TP_SIZE=16 NNODES=2 NODE_RANK=0 MEM_FRACTION=0.90 \
+  DIST_INIT_ADDR=172.31.28.159 bash 20_launch_prefill.sh
+# P5EN-2 -- same line, NODE_RANK=1, SAME DIST_INIT_ADDR
+QUANT=bf16 TP_SIZE=16 NNODES=2 NODE_RANK=1 MEM_FRACTION=0.90 \
+  DIST_INIT_ADDR=172.31.28.159 bash 20_launch_prefill.sh
+
+# --- DECODE instance: P5EN-3 (side rank 0) + P5EN-4 ---
+QUANT=bf16 TP_SIZE=16 NNODES=2 NODE_RANK=0 MEM_FRACTION=0.90 \
+  DIST_INIT_ADDR=172.31.29.216 bash 21_launch_decode.sh
+QUANT=bf16 TP_SIZE=16 NNODES=2 NODE_RANK=1 MEM_FRACTION=0.90 \
+  DIST_INIT_ADDR=172.31.29.216 bash 21_launch_decode.sh
+
+# --- router, anywhere that can reach both side-rank-0 hosts ---
+PREFILL_IPS=172.31.28.159 DECODE_IPS=172.31.29.216 bash 22_launch_router.sh
+ENDPOINT=localhost:8000 SRV=hy4-prefill bash 91_bench.sh
+```
+
+**Each side needs its own `DIST_INIT_ADDR`.** These are two independent NCCL
+groups; pointing all four at one address makes the four nodes try to form a
+single TP32 world and hang in the rendezvous. The IPs are private (ENA) and
+change on a stop/start -- read them (`hostname -I`) rather than reusing the ones
+above.
+
+`PREFILL_IPS` / `DECODE_IPS` take **one IP per instance, not per node**: only
+each side's rank 0 binds `:$PORT`. So a four-node 1P1D gives the router two
+addresses, the same as a two-node one.
+
+What the plumbing does for you: `GPUS_PER_NODE` becomes `TP_SIZE/NNODES` = 8,
+`BENCH_GPUS` becomes `TP_SIZE*2` = 32, which is correct here (two instances x 16
+GPUs), and `TOPO` self-stamps as `pd1p1d-tp16x2node-mooncake-efa`. That last one
+is recent -- the old default called a two-node-per-side pair and a
+one-node-per-side pair both `pd1p1d-tp16-mooncake` (§3).
+
+`MEM_FRACTION=0.90` is carried over from the two-node standalone arm and is *not*
+validated for PD, where the decode side additionally holds a KV pool the prefill
+side does not. Read the pool size out of each side's startup log; if the decode
+side OOMs during graph capture, lower it there -- and never use the OOM message's
+suggested `expandable_segments:True`, which breaks Mooncake outright (§4).
+
+`A2A_BACKEND` stays `none`: BF16 on H200 blocks every a2a backend (§4), so this
+arm measures the TP all-reduce and the KV transfer, not MoE communication.
 
 ### Two B300: 1P1D prefill/decode disaggregation
 
@@ -1036,7 +1100,12 @@ and none of the above.
 * `04_fix_multinic_routing.sh`'s **fix path** has only ever been exercised on
   p6-b300. On p5en there is nothing for it to fix (§2): its `--check` correctly
   reports "single-NIC node", so what is untested there is only the no-op branch.
-* **TP32 on four p5en** is legal arithmetic and nothing more.
+* **Nothing has ever run on four p5en.** Three arms are written up in §2 and none
+  is measured: **1P1D with TP16 per side**, its control **two independent TP16
+  servers**, and **TP32 as one server**. The first two are the pair that makes
+  either interpretable -- the B300 precedent has 1P1D losing to 2x-solo by 54.9%
+  at c=256 (§3), so a 1P1D number alone would say nothing. The blocker is
+  scheduling, not knowledge: P5EN-1/2 are in use by another workload.
 * **BF16 TP8 on B300** has never been run, though it is a verified cookbook cell.
 * **`EP_SIZE=8 A2A_BACKEND=none` vs pure TP** at TP8 has never been measured. It
   is not obvious in either direction: masked EP trades MoE FLOPs per rank for zero

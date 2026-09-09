@@ -6,6 +6,13 @@
 #   TRANSFER_BACKEND=nixl bash 20_launch_prefill.sh      # NIXL/LIBFABRIC instead
 #   EP_SIZE=8 bash 20_launch_prefill.sh                  # EP on the prefill side
 #
+# A side can span more than one node -- on four p5en, 1P1D means TP16 across two
+# nodes PER SIDE. Run this on both of the prefill nodes with NODE_RANK 0 and 1 and
+# the SAME DIST_INIT_ADDR (that side's rank 0); the decode side gets its OWN
+# rendezvous address, because the two sides are independent NCCL groups:
+#   QUANT=bf16 TP_SIZE=16 NNODES=2 NODE_RANK=0 DIST_INIT_ADDR=$P_RANK0 \
+#     MEM_FRACTION=0.90 bash 20_launch_prefill.sh
+#
 # TP_SIZE, SPEC, TRANSFER_BACKEND and the MoE geometry (A2A_BACKEND / EP_SIZE /
 # DP_ATTN) must match on BOTH sides -- none of them is negotiated at handshake
 # time, and a mismatch surfaces as a stalled request or a blacklisted Mooncake
