@@ -104,6 +104,30 @@ mkdir -p "$RESULTS_DIR"
 LOG="$RESULTS_DIR/${TAG}.log"
 JSON="$RESULTS_DIR/${TAG}.json"
 
+# ONE FILE = ONE RUN. bench_serving's --output-file APPENDS (it is JSONL and that
+# is upstream behaviour), while the .log below is truncated -- so re-running the
+# same TAG used to leave a .json with two rows and a .log describing only the
+# second. That is how the 2026-09-09 p5en c=1 point ended up holding both a TCP
+# and an EFA run under one name, a 2.63x difference recoverable only by
+# reconstructing container start times
+# (results/bf16-tp16x2node-TCPFALLBACK-README.md).
+#
+# Rotate the previous PAIR into results/superseded/ instead: nothing is deleted,
+# the pair stays matched, and gen_bench_table.py's non-recursive glob("*.log")
+# does not see it -- so a superseded run cannot reappear as a duplicate row with
+# identical axes. Give the rerun a distinguishing TAG if you want it published.
+if [[ -f "$LOG" || -f "$JSON" ]]; then
+    _sup="$RESULTS_DIR/superseded"
+    mkdir -p "$_sup"
+    _n=1
+    while [[ -e "$_sup/${TAG}.run${_n}.log" || -e "$_sup/${TAG}.run${_n}.json" ]]; do
+        _n=$(( _n + 1 ))
+    done
+    [[ -f "$LOG" ]]  && mv "$LOG"  "$_sup/${TAG}.run${_n}.log"
+    [[ -f "$JSON" ]] && mv "$JSON" "$_sup/${TAG}.run${_n}.json"
+    echo "note : a previous run under this tag was moved to superseded/${TAG}.run${_n}.*" >&2
+fi
+
 echo "bench: ${ENDPOINT}  isl=${ISL} osl=${OSL} n=${NUM_PROMPTS} conc=${CONCURRENCY}"
 echo "log  : ${LOG}"
 

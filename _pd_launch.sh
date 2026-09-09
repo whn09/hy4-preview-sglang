@@ -31,6 +31,12 @@ build_moe_args
 # deepep_v2 needs three source patches, one of which is a numerics fix, so
 # the image is verified by a marker rather than trusted.
 [[ "$A2A_BACKEND" == "deepep_v2" ]] && require_deepep_v2_image "$IMAGE"
+# require_efa_image only proves mooncake can move a KV cache over EFA. NCCL is a
+# SEPARATE consumer: at NNODES>1 each side's TP all-reduce needs aws-ofi-nccl too,
+# and without it that traffic silently goes to TCP while the KV transfer stays on
+# EFA -- a half-fallback with no error anywhere. build_efa_args returns early for
+# an image that ships the plugin (the PD image does) and also sets NET_TAG.
+build_efa_args
 
 # Pin the ranks rather than exposing all 8 GPUs: the device set becomes part of
 # the container's config instead of an accident of enumeration order, and at
@@ -63,7 +69,10 @@ fi
 # 91_bench.sh. BENCH_GPUS is the tok/s/GPU denominator and it is NOT $TP_SIZE
 # here: a 1P1D pair occupies TP_SIZE GPUs on each of two hosts. Getting this
 # wrong is how a PD arm gets credited with double its real per-GPU throughput.
-TOPO="${TOPO:-pd1p1d-tp${TP_SIZE}-${TRANSFER_BACKEND:-mooncake}${MOE_TAG}}"
+# NNODES is stamped too: a 1P1D at TP16 is two nodes per side and a completely
+# different arm from a 1P1D at TP16 on one node, yet the old default called both
+# "pd1p1d-tp16-mooncake". NET_TAG comes from build_efa_args (empty at NNODES=1).
+TOPO="${TOPO:-pd1p1d-tp${TP_SIZE}x${NNODES}node-${TRANSFER_BACKEND:-mooncake}${MOE_TAG}${NET_TAG}}"
 BENCH_GPUS="${BENCH_GPUS:-$(( TP_SIZE * 2 ))}"
 
 docker run -d --name "$NAME" \
@@ -73,6 +82,7 @@ docker run -d --name "$NAME" \
     --ulimit memlock=-1 --ulimit stack=67108864 \
     --cap-add SYS_NICE \
     --device=/dev/infiniband ${GDR_ARGS[@]+"${GDR_ARGS[@]}"} \
+    ${EFA_ARGS[@]+"${EFA_ARGS[@]}"} \
     --shm-size=64g \
     -v "$HOST_MODEL_DIR/$MODEL_DIRNAME:$MODEL_PATH:ro" \
     "${CACHE_ARGS[@]}" \

@@ -956,11 +956,22 @@ except Exception: print("0.0.0")' 2>/dev/null | tr -d '\r')
 # An image that ships its own aws-ofi-nccl keeps it: the deepep-v2-efa-official
 # images pin a libfabric their DeepEP was built against, and replacing it with
 # the host's is a change we have not measured.
+#
+# Also sets NET_TAG, which the launchers append to TOPO so that the transport is
+# an AXIS IN THE FILENAME. It has to be: at NNODES>1 the same tag with and
+# without the plugin measured 46.31 vs 122.00 out tok/s on the same two hosts
+# (results/bf16-tp16x2node-TCPFALLBACK-README.md), and the two runs collided in
+# one file because "tp16x2node" says how many nodes but not what they talk over.
+# Empty at NNODES=1, where there is no wire and no axis.
 EFA_ARGS=()
+NET_TAG=""
 build_efa_args() {
     EFA_ARGS=()
+    NET_TAG=""
     (( NNODES <= 1 )) && return 0
+    NET_TAG="-efa"
     if [[ "${EFA_INJECT:-auto}" == "0" ]]; then
+        NET_TAG="-tcp"
         echo "WARNING: EFA_INJECT=0 at NNODES=$NNODES -- NCCL will use TCP over" >&2
         echo "         ${PRIMARY_IFACE:-the ENA interface}. Any cross-node number from this" >&2
         echo "         run is a socket number. Verify with: bash 93_check_efa.sh" >&2

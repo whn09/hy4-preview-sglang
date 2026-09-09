@@ -170,7 +170,7 @@ docker run -d --name "$NAME" \
     -e QUANT="$QUANT" \
     -e PROFILE="$PROFILE" \
     -e SPEC="$SPEC" \
-    -e TOPO="${TOPO:-tp${TP_SIZE}x${NNODES}node${MOE_TAG}}" \
+    -e TOPO="${TOPO:-tp${TP_SIZE}x${NNODES}node${MOE_TAG}${NET_TAG}}" \
     -e BENCH_GPUS="${BENCH_GPUS:-$TP_SIZE}" \
     -e TP_SIZE="$TP_SIZE" \
     -e A2A_BACKEND="$A2A_BACKEND" \
@@ -201,7 +201,7 @@ docker run -d --name "$NAME" \
 
 echo "launched '$NAME': quant=$QUANT tp=$TP_SIZE gpus=$GPU_LIST profile=$PROFILE spec=$SPEC image=$IMAGE"
 echo "  moe   : a2a=$A2A_BACKEND ep=$EP_EFF moe_tp=$(( TP_SIZE / EP_EFF )) dp_attn=${DP_ATTN:-off}$([[ "$A2A_BACKEND" == "deepep_v2" ]] && echo " v2_cap=$V2_CAP")"
-echo "  topo  : ${TOPO:-tp${TP_SIZE}x${NNODES}node${MOE_TAG}}"
+echo "  topo  : ${TOPO:-tp${TP_SIZE}x${NNODES}node${MOE_TAG}${NET_TAG}}"
 if (( NNODES > 1 )); then
     echo "  tp=$TP_SIZE over $NNODES nodes, this host is node-rank $NODE_RANK, rendezvous ${DIST_INIT_ADDR}:${DIST_INIT_PORT}"
     echo "  (rank != 0 never binds :$PORT -- do not wait for 'server is fired up' there)"
