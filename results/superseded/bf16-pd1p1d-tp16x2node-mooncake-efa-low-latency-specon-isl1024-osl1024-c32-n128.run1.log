@@ -1,0 +1,15 @@
+### tag=bf16-pd1p1d-tp16x2node-mooncake-efa-low-latency-specon-isl1024-osl1024-c32-n128
+### endpoint=localhost:8000 image=hy4-preview-efa:latest
+### quant=bf16 tp=16 nnodes=2 profile=low-latency spec=on
+### topo=pd1p1d-tp16x2node-mooncake-efa gpus=32 backend=mooncake
+### moe_a2a=none ep=unknown dp_attn=unknown v2_cap=unknown chunk=unknown
+### isl=1024 osl=1024 num_prompts=128 concurrency=32 max_running=unknown
+### started=2026-09-09T09:52:08Z
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/sgl-workspace/sglang/python/sglang/bench_serving.py", line 10, in <module>
+    from sglang.benchmark.serving import *  # noqa: F401,F403
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+ModuleNotFoundError: No module named 'sglang.benchmark.serving'
+### finished=2026-09-09T09:52:08Z rc=1
