@@ -67,7 +67,8 @@ MUST_MATCH = [
 # an a2a=none arm anyway (utils/common.py:3887 tests the a2a backend), so setting
 # it only on the DeepEP arm makes the two arms agree on the layout instead of
 # adding an axis. See the DISABLE_ATTN_TP_GATHER block in start_server.sh.
-REPORT_ONLY = ["moe_a2a_backend", "ep_size", "deepep_v2_mode", "moe_runner_backend",
+REPORT_ONLY = ["moe_a2a_backend", "deepep_mode", "deepep_dispatcher_output_dtype",
+               "ep_size", "deepep_v2_mode", "moe_runner_backend",
                "speculative_moe_a2a_backend", "disable_attn_tp_gather"]
 
 

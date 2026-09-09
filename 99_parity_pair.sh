@@ -65,12 +65,25 @@ env "${COMMON[@]}" A2A_BACKEND=none \
     bash 10_launch_standalone.sh
 fi
 
-echo "=== test arm: a2a=$TEST_A2A tp=$TP gpus $TP-$((2*TP-1)) port $TEST_PORT atg=$ATG"
-env "${COMMON[@]}" A2A_BACKEND="$TEST_A2A" DEEPEP_MODE=normal DISPATCH_DTYPE=bf16 \
+# The dispatch axes, defaulted to the pair that is known to SERVE and pinned so the
+# filename carries them. They are not free choices:
+#   TEST_DISPATCH=bf16 is the only granularity matching [1,32] weights, but bf16
+#     carries no activation scale, so the masked (low-latency) runner dies at
+#     moe_runner/deep_gemm.py:718 -- hence TEST_MODE=normal.
+#   TEST_DISPATCH=fp8 + TEST_MODE=auto is the FAST arm (graphs, low-latency decode)
+#     and the only one that could ever serve deepep_v2, whose dispatch is masked-only.
+#     It was condemned as "fluent nonsense" at 0/4 -- but that was measured BEFORE
+#     blocker 7 was known, so it conflates an fp8 scale misread with the 7/8-token
+#     drop. Re-run it with ATG=1 before believing either verdict.
+TEST_MODE="${TEST_MODE:-normal}"
+TEST_DISPATCH="${TEST_DISPATCH:-bf16}"
+
+echo "=== test arm: a2a=$TEST_A2A tp=$TP gpus $TP-$((2*TP-1)) port $TEST_PORT atg=$ATG mode=$TEST_MODE disp=$TEST_DISPATCH"
+env "${COMMON[@]}" A2A_BACKEND="$TEST_A2A" DEEPEP_MODE="$TEST_MODE" DISPATCH_DTYPE="$TEST_DISPATCH" \
     DISABLE_ATTN_TP_GATHER="$ATG" ${CG_OFF[@]+"${CG_OFF[@]}"} \
     SGLANG_DEEPGEMM_STANDARD_LAYOUT="${TEST_LAYOUT:-compact}" \
     GPU_LIST="$(seq -s, "$TP" $((2*TP-1)))" \
-    NAME=hy4-parity-test PORT="$TEST_PORT" TOPO="parity-test-$TEST_A2A-tp$TP" \
+    NAME=hy4-parity-test PORT="$TEST_PORT" TOPO="parity-test-$TEST_A2A-tp$TP-$TEST_MODE-$TEST_DISPATCH" \
     bash 10_launch_standalone.sh
 
 for pair in "hy4-parity-ref:$REF_PORT" "hy4-parity-test:$TEST_PORT"; do
@@ -87,7 +100,7 @@ for pair in "hy4-parity-ref:$REF_PORT" "hy4-parity-test:$TEST_PORT"; do
 done
 
 mkdir -p results
-OUT="results/parity-tp${TP}-none_vs_${TEST_A2A}-atg${ATG}-cgoff${TEST_CG_OFF:-0}.txt"
+OUT="results/parity-tp${TP}-none_vs_${TEST_A2A}-atg${ATG}-mode${TEST_MODE}-disp${TEST_DISPATCH}-cgoff${TEST_CG_OFF:-0}.txt"
 NF=(); [[ "$TEST_A2A" == none ]] && NF=(--noise-floor)
 python3 96_logprob_parity.py --ref "localhost:$REF_PORT" --test "localhost:$TEST_PORT" \
     ${NF[@]+"${NF[@]}"} 2>&1 | tee "$OUT"
