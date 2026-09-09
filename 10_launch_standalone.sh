@@ -44,6 +44,11 @@ build_moe_args
 if (( NNODES > 1 )) && [[ "$A2A_BACKEND" == deepep* ]]; then
     require_gin_capable_image "$IMAGE"
 fi
+# EVERY cross-node arm needs the OFI plugin, not just the DeepEP ones: plain NCCL
+# cannot reach an EFA NIC without it and silently uses TCP over ENA instead. Fills
+# EFA_ARGS from the host stack when the image has none. (Cost of not having this,
+# measured 2026-09-09 on P5EN-3/4: a TP16 a2a=none arm with 0 bytes on EFA.)
+build_efa_args
 
 # Pin the ranks rather than exposing all 8 GPUs even at TP8: the device set then
 # belongs to the container's config instead of being an accident of which GPUs
@@ -157,6 +162,7 @@ docker run -d --name "$NAME" \
     --cap-add SYS_NICE \
     --device=/dev/infiniband \
     ${PRIV_ARGS[@]+"${PRIV_ARGS[@]}"} \
+    ${EFA_ARGS[@]+"${EFA_ARGS[@]}"} \
     --shm-size=64g \
     -v "$HOST_MODEL_DIR/$MODEL_DIRNAME:$MODEL_PATH:ro" \
     "${CACHE_ARGS[@]}" \

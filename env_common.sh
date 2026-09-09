@@ -928,6 +928,89 @@ except Exception: print("0.0.0")' 2>/dev/null | tr -d '\r')
     fi
 }
 
+# ---- EFA for plain NCCL, not just for DeepEP ----
+# The gate above is scoped to deepep*, and that scoping is what let a silent TCP
+# run through. Measured 2026-09-09 on P5EN-3/4, A2A_BACKEND=none NNODES=2 TP16
+# BF16 on lmsysorg/sglang:hy4-preview: the server came up, served, and moved
+# ZERO bytes over EFA -- the aggregate tx delta across all 16 rdmap* NICs was 0
+# over 5 s while the ENA interface carried 159 MB/s each way. Decode was 53.64
+# tok/s at bs=1 = 74.6 ms/step, of which only ~1.1 ms is the 43.7B active
+# parameters' weight read, so >95% of the step was Hy4's TP all-reduce on TCP.
+#
+# a2a=none is the arm that needs this MOST, not least: it has no dispatch/combine
+# collective, so the 2 all-reduces x 78 layers ARE the entire cross-node traffic.
+# --device=/dev/infiniband does not help -- it hands device nodes to a stack with
+# no libfabric to drive them, and NCCL reports NET/Socket and works.
+#
+# The host already carries the whole stack (efa installer 3.3.0, libfabric 2.6.0,
+# /opt/amazon/ofi-nccl/lib/libnccl-net-ofi.so), so mount it instead of rebuilding
+# a 49 GB image. Mounting /opt/amazon ALONE is NOT enough: the host's libfabric
+# 2.6.0 links against the host's rdma-core and the image's distro copies are
+# older, which surfaces as
+#   OSError: /lib/x86_64-linux-gnu/libefa.so.1: version `EFA_1.7' not found
+# so the two rdma-core sonames and the provider directory come along too, under
+# /host-efa so that LD_LIBRARY_PATH order is the only thing shadowed. Verified in
+# a throwaway container on P5EN-3: fi_info -p efa enumerates the provider and
+# libnccl-net-ofi.so dlopens clean.
+#
+# An image that ships its own aws-ofi-nccl keeps it: the deepep-v2-efa-official
+# images pin a libfabric their DeepEP was built against, and replacing it with
+# the host's is a change we have not measured.
+EFA_ARGS=()
+build_efa_args() {
+    EFA_ARGS=()
+    (( NNODES <= 1 )) && return 0
+    if [[ "${EFA_INJECT:-auto}" == "0" ]]; then
+        echo "WARNING: EFA_INJECT=0 at NNODES=$NNODES -- NCCL will use TCP over" >&2
+        echo "         ${PRIMARY_IFACE:-the ENA interface}. Any cross-node number from this" >&2
+        echo "         run is a socket number. Verify with: bash 93_check_efa.sh" >&2
+        return 0
+    fi
+
+    if docker run --rm --entrypoint bash "$IMAGE" -c \
+         'ls /opt/amazon/ofi-nccl/lib/libnccl-net*.so' >/dev/null 2>&1; then
+        echo "EFA: '$IMAGE' ships aws-ofi-nccl; keeping the image's own stack." >&2
+        return 0
+    fi
+
+    local plugin=/opt/amazon/ofi-nccl/lib/libnccl-net-ofi.so
+    if [[ ! -f "$plugin" ]]; then
+        echo "ERROR: NNODES=$NNODES, but neither '$IMAGE' nor this host has the" >&2
+        echo "       aws-ofi-nccl plugin. NCCL cannot speak EFA without it and will" >&2
+        echo "       fall back to TCP over ENA -- it will NOT fail, it will just be" >&2
+        echo "       slow and report zero EFA traffic (measured: 53.64 tok/s at bs=1)." >&2
+        echo "       Either install aws-efa-installer on the host, or use an EFA image" >&2
+        echo "       (bash 05_pull_pd_image.sh -> hy4-preview-efa:latest), or set" >&2
+        echo "       EFA_INJECT=0 to accept TCP knowingly." >&2
+        exit 1
+    fi
+
+    local libdir=/usr/lib/x86_64-linux-gnu
+    local efa_so ibv_so
+    efa_so=$(readlink -f "$libdir/libefa.so.1" 2>/dev/null || true)
+    ibv_so=$(readlink -f "$libdir/libibverbs.so.1" 2>/dev/null || true)
+    if [[ ! -f "$efa_so" || ! -f "$ibv_so" ]]; then
+        echo "ERROR: the host has $plugin but not rdma-core" >&2
+        echo "       ($libdir/lib{efa,ibverbs}.so.1). Reinstall aws-efa-installer." >&2
+        exit 1
+    fi
+
+    # Prepending replaces the image's LD_LIBRARY_PATH, so carry its value forward.
+    # EFA_BASE_LD_PATH is the CUDA/driver part of lmsysorg/sglang's own setting;
+    # override it if a different base image is used.
+    EFA_ARGS=(
+        -v /opt/amazon:/opt/amazon:ro
+        -v /etc/libibverbs.d:/etc/libibverbs.d:ro
+        -v "$efa_so:/host-efa/libefa.so.1:ro"
+        -v "$ibv_so:/host-efa/libibverbs.so.1:ro"
+        -v "$libdir/libibverbs:/host-efa/libibverbs:ro"
+        -e "LD_LIBRARY_PATH=/host-efa:/host-efa/libibverbs:/opt/amazon/ofi-nccl/lib:/opt/amazon/efa/lib:${EFA_BASE_LD_PATH:-/usr/local/nvidia/lib:/usr/local/nvidia/lib64:/usr/local/cuda/lib64}"
+    )
+    echo "EFA: injecting the host stack into '$IMAGE'" \
+         "(libfabric $(/opt/amazon/efa/bin/fi_info --version 2>/dev/null | awk '/^libfabric:/{print $2}')," \
+         "$(ls -d /sys/class/infiniband/* 2>/dev/null | wc -l) NICs)." >&2
+}
+
 # Fills MULTINODE_ARGS. Fails fast rather than hanging for --dist-timeout when
 # the rendezvous address is missing or TP does not divide over the nodes.
 build_multinode_args() {
