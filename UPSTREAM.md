@@ -12,6 +12,15 @@
 
 C and B1 below are **not** submitted; the rest of this file is the triage they came from.
 
+**Validated on hardware 2026-09-09** — see `pr_validation/`. One p5en.48xlarge closed
+the "unit tests not run locally" caveat in all three bodies (#38607: 94 passed / 46
+subtests; #38608: the hook is value-identical to DeepSeek's on the preview shape;
+#38609: a new unit test that **fails on `main`** and passes on the branch, pushed as a
+second commit, plus a 7-arm end-to-end matrix on `Qwen3-30B-A3B-FP8` with the hook
+deleted from `qwen3_moe.py`). The matrix also forced a correction posted on #38609: the
+bare `AssertionError` needs an **a2a backend**, because `init_new` is only reached from
+`_forward_deepep` — with `a2a=none` a hookless class serves fine on `main`.
+
 Re-verified 2026-09-09 against `sgl-project/sglang` `origin/main` @ **`8ab9982851`**
 (2026-09-09 09:44 +0800), i.e. four days after HYV4 merged (PR #36805, `55bf338`).
 **Every finding below is still present at that tip**, and `gh search issues --repo

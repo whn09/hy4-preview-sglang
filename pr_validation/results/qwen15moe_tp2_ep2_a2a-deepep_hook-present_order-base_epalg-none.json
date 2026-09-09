@@ -1,0 +1,20 @@
+{
+  "tag": "qwen15moe_tp2_ep2_a2a-deepep_hook-present_order-base_epalg-none",
+  "outcome": "crashed",
+  "exception": "NotImplementedError: Unquantized DeepEP MoE currently supports low_latency mode only",
+  "exception_is_bare": false,
+  "log_tail": [
+    "    return inner(*args, **kwargs)",
+    "           ^^^^^^^^^^^^^^^^^^^^^^",
+    "  File \"/opt/dlami/nvme/wt-e2e/python/sglang/srt/layers/moe/ep_moe/layer.py\", line 195, in _a2a_forward_with_output_impl",
+    "    self.forward_impl(",
+    "  File \"/opt/dlami/nvme/wt-e2e/python/sglang/srt/layers/moe/ep_moe/layer.py\", line 267, in forward_impl",
+    "    combine_input = self.run_moe_core(dispatch_output)",
+    "                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^",
+    "  File \"/opt/dlami/nvme/wt-e2e/python/sglang/srt/layers/moe/ep_moe/layer.py\", line 292, in run_moe_core",
+    "    raise NotImplementedError(",
+    "NotImplementedError: Unquantized DeepEP MoE currently supports low_latency mode only",
+    "[2026-09-09 04:31:39] Received sigquit from a child process. It usually means the child failed.",
+    "[2026-09-09 04:31:39] kill_process_tree called: parent_pid=4809, include_parent=True, pid=4809"
+  ]
+}

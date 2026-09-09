@@ -1,0 +1,20 @@
+{
+  "tag": "qwen15moe_tp2_ep2_a2a-deepep_hook-removed_order-base_epalg-none",
+  "outcome": "crashed",
+  "exception": "AssertionError",
+  "exception_is_bare": true,
+  "log_tail": [
+    "           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^",
+    "  File \"/opt/dlami/nvme/wt-e2e-nohook/python/sglang/srt/models/qwen2_moe.py\", line 750, in forward",
+    "    return self._forward_deepep(hidden_states, forward_batch)",
+    "           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^",
+    "  File \"/opt/dlami/nvme/wt-e2e-nohook/python/sglang/srt/models/qwen2_moe.py\", line 600, in _forward_deepep",
+    "    ExpertLocationDispatchInfo.init_new(",
+    "  File \"/opt/dlami/nvme/wt-e2e-nohook/python/sglang/srt/eplb/expert_location_dispatch.py\", line 45, in init_new",
+    "    assert expert_location_metadata is not None",
+    "           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^",
+    "AssertionError",
+    "[2026-09-09 04:32:16] Received sigquit from a child process. It usually means the child failed.",
+    "[2026-09-09 04:32:16] kill_process_tree called: parent_pid=5721, include_parent=True, pid=5721"
+  ]
+}

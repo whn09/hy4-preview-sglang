@@ -1,0 +1,26 @@
+{
+  "tag": "qwen3moe-fp8_tp2_ep2_a2a-deepep-auto_hook-present_order-fixed_epalg-static",
+  "outcome": "served",
+  "completions": [
+    {
+      "prompt": "The capital of France is",
+      "text": " Paris. The capital of the United Kingdom is London. The capital of Germany is Berlin. The capital of Spain is Madrid. The capital of Italy is Rome."
+    },
+    {
+      "prompt": "Write one sentence about the sea:",
+      "text": " the sea is a vast, mysterious body of saltwater that covers most of the Earth's surface, shaping coastlines and sustaining a diverse array of marine life."
+    },
+    {
+      "prompt": "2 + 2 =",
+      "text": " 4, 2 + 3 = 5, 2 + 4 = 6, 2 + 5 = 7, 2"
+    },
+    {
+      "prompt": "List three prime numbers:",
+      "text": " 2, 3, 5, 7, 11, 13, 17, 19, 23,"
+    },
+    {
+      "prompt": "def add(a, b):",
+      "text": "\n    return a + b\n\ndef subtract(a, b):\n    return a - b\n\ndef multiply(a, b):\n    return a * b\n\ndef"
+    }
+  ]
+}

@@ -1,0 +1,20 @@
+{
+  "tag": "probe_qwen15moe_tp2_ep2_a2a-deepep-ll_hook-present_order-base_epalg-none",
+  "outcome": "crashed",
+  "exception": "RuntimeError: Assertion exception (/tmp/sgl-deep-ep-build.85VKfa/csrc/legacy/buffer.hpp:1483): x.size(0) == topk_idx.size(0) and x.size(0) <= num_max_dispatch_tokens_per_rank",
+  "exception_is_bare": false,
+  "log_tail": [
+    "    inner_state = self._get_impl().dispatch_a(",
+    "                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^",
+    "  File \"/opt/dlami/nvme/wt-e2e/python/sglang/srt/layers/moe/token_dispatcher/deepep.py\", line 723, in dispatch_a",
+    "    hidden_states, masked_m, event, hook = self._dispatch_core(",
+    "                                           ^^^^^^^^^^^^^^^^^^^^",
+    "  File \"/opt/dlami/nvme/wt-e2e/python/sglang/srt/layers/moe/token_dispatcher/deepep.py\", line 837, in _dispatch_core",
+    "    buffer.low_latency_dispatch(",
+    "  File \"/opt/sglang/lib/python3.12/site-packages/deep_ep/buffers/legacy.py\", line 619, in low_latency_dispatch",
+    "    self.runtime.low_latency_dispatch(x, topk_idx,",
+    "RuntimeError: Assertion exception (/tmp/sgl-deep-ep-build.85VKfa/csrc/legacy/buffer.hpp:1483): x.size(0) == topk_idx.size(0) and x.size(0) <= num_max_dispatch_tokens_per_rank",
+    "[2026-09-09 04:34:15] Received sigquit from a child process. It usually means the child failed.",
+    "[2026-09-09 04:34:15] kill_process_tree called: parent_pid=7409, include_parent=True, pid=7409"
+  ]
+}

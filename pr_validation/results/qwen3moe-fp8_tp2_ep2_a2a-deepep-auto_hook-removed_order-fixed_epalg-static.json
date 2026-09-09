@@ -1,0 +1,20 @@
+{
+  "tag": "qwen3moe-fp8_tp2_ep2_a2a-deepep-auto_hook-removed_order-fixed_epalg-static",
+  "outcome": "crashed",
+  "exception": "AssertionError: no expert location metadata: the model class is missing get_model_config_for_expert_location",
+  "exception_is_bare": false,
+  "log_tail": [
+    "  File \"/opt/dlami/nvme/wt-e2e-nohook-fixed/python/sglang/srt/models/qwen3_moe.py\", line 302, in forward",
+    "    return self.forward_deepep(hidden_states, forward_batch)",
+    "           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^",
+    "  File \"/opt/dlami/nvme/wt-e2e-nohook-fixed/python/sglang/srt/models/qwen3_moe.py\", line 350, in forward_deepep",
+    "    expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(",
+    "                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^",
+    "  File \"/opt/dlami/nvme/wt-e2e-nohook-fixed/python/sglang/srt/eplb/expert_location_dispatch.py\", line 48, in init_new",
+    "    assert expert_location_metadata is not None, (",
+    "           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^",
+    "AssertionError: no expert location metadata: the model class is missing get_model_config_for_expert_location",
+    "[2026-09-09 04:48:24] Received sigquit from a child process. It usually means the child failed.",
+    "[2026-09-09 04:48:24] kill_process_tree called: parent_pid=17757, include_parent=True, pid=17757"
+  ]
+}

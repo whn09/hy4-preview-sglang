@@ -1,0 +1,26 @@
+{
+  "tag": "qwen15moe_tp2_hook-removed_order-base_epalg-none",
+  "outcome": "served",
+  "completions": [
+    {
+      "prompt": "The capital of France is",
+      "text": "______.\nA. London\nB. Madrid\nC. Rome\nD. Paris\n\u7b54\u6848:\nD"
+    },
+    {
+      "prompt": "Write one sentence about the sea:",
+      "text": " The sea is a vast and powerful body of water that covers most of our planet and is home to a diverse range of plants and animals. \u6d77\u6d0b\u662f"
+    },
+    {
+      "prompt": "2 + 2 =",
+      "text": " 4\n2 * 2 = 4\n2 / 2 = 1\n2 % 2 = 0\n\n2. 3 +"
+    },
+    {
+      "prompt": "List three prime numbers:",
+      "text": "  2, 3, ____\nThe missing prime number is 5."
+    },
+    {
+      "prompt": "def add(a, b):",
+      "text": " return a + b\ndef subtract(a, b): return a - b\ndef multiply(a, b): return a * b\ndef divide(a, b"
+    }
+  ]
+}
