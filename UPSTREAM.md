@@ -1,5 +1,17 @@
 # What of this kit belongs upstream, and what does not
 
+**Submitted 2026-09-09**, all on `sgl-project/sglang` `main` @ **`76eea36e38`**, from the
+`whn09/sglang` fork:
+
+| upstream | what | branch |
+|---|---|---|
+| [issue #38606](https://github.com/sgl-project/sglang/issues/38606) | D — HYV4 + a2a computes 1 token in 8 | — |
+| [PR #38607](https://github.com/sgl-project/sglang/pull/38607) | the `model_overrides` declaration that fixes D | `fix/hyv4-attn-tp-gather` |
+| [PR #38608](https://github.com/sgl-project/sglang/pull/38608) | A — `get_model_config_for_expert_location` | `fix/hyv4-expert-location` |
+| [PR #38609](https://github.com/sgl-project/sglang/pull/38609) | A′ — the assert before the early return | `fix/eplb-assert-order` |
+
+C and B1 below are **not** submitted; the rest of this file is the triage they came from.
+
 Re-verified 2026-09-09 against `sgl-project/sglang` `origin/main` @ **`8ab9982851`**
 (2026-09-09 09:44 +0800), i.e. four days after HYV4 merged (PR #36805, `55bf338`).
 **Every finding below is still present at that tip**, and `gh search issues --repo
@@ -15,9 +27,9 @@ model. Any PR that implies "DeepEP is now good on Hy4" would be unsupported.
 
 | # | finding | upstream site @ `8ab9982851` | our artifact | verdict |
 |---|---|---|---|---|
-| D | HYV4 + DeepEP silently computes 1 token in 8 | `utils/common.py:3879`, `models/hunyuan_v4.py:606` | flag `--disable-attn-tp-gather` | **issue + small PR** |
-| A | HYV4 has no expert-location hook ⇒ bare `AssertionError` | `models/hunyuan_v4.py:667`, `eplb/expert_location.py:758` | `patches/hunyuan_v4.diff` | **PR (6 lines)** |
-| A′ | the assert fires on a value the next line discards | `eplb/expert_location_dispatch.py:45` vs `:47` | — | **PR (2 lines)**, optional |
+| D | HYV4 + DeepEP silently computes 1 token in 8 | `utils/common.py:3879`, `models/hunyuan_v4.py:606` | flag `--disable-attn-tp-gather` | **sent: #38606 + #38607** |
+| A | HYV4 has no expert-location hook ⇒ bare `AssertionError` | `models/hunyuan_v4.py:667`, `eplb/expert_location.py:758` | `patches/hunyuan_v4.diff` | **sent: #38608** |
+| A′ | the assert fires on a value the next line discards | `eplb/expert_location_dispatch.py:45` vs `:47` | — | **sent: #38609** |
 | C | DSV4 silu post-quant kernel only exists at group 128 | `kernels/jit/csrc/deepseek_v4/silu_and_mul_masked_post_quant.cuh:117,263,403,486` | `patches/silu_group32.diff` | **PR, needs a test** |
 | B1 | DeepEP-**normal** pre-permute hard-codes group 128 | `moe_runner/deep_gemm.py:1333` (`:1381`, `:1387`) | `patches/mr_dg_normal.diff` | **PR, needs discussion** |
 | B2 | DeepEP-**v2** pre-permute sets no `mxfp8_act_gran_k` | `moe_runner/deep_gemm.py:1672` | `patches/mr_deep_gemm.diff` hunk A | hold — untested |
@@ -55,10 +67,22 @@ documented UI.
 
 The fix is not the flag — the flag is our workaround. Upstream has the idiomatic channel
 already: `arg_groups/model_overrides/` (30 files, keyed on `hf_config.architectures[0]`,
-`@_register_for(...) -> dict`). A `model_overrides/hunyuan_v4.py` declaring
-`{"disable_attn_tp_gather": True}` when `moe_a2a_backend != "none"` — with the `logger.info`
-that every sibling override carries — is ~15 lines and reads exactly like
-`qwen3_moe.py`. `require_attn_tp_gather`'s own comment already describes HYV4's case:
+`@_register_for(...) -> dict`). Two things about it that were not obvious and that
+**PR #38607** had to get right:
+
+* HYV4 is **already claimed** by `model_overrides/deepseek_v2.py` (it is in that module's
+  `@_register_for` list, and `__init__.py` forbids two modules declaring one field for one
+  arch), so the declaration goes in that file's existing HYV4 branch — *not* in a new
+  `model_overrides/hunyuan_v4.py`, which is what an earlier draft of this file said.
+* `disable_attn_tp_gather` was not tagged `resolvable=True`, so a declaration would have
+  been rejected; tagging it obliges extending the pinned resolvable-field set in
+  `test/registered/unit/test_model_overrides.py:57` in the same commit.
+
+The declaration is also **unconditional**, not gated on `moe_a2a_backend != "none"`:
+`overrides.py:1668`'s post-process turns `--enable-waterfill` into
+`moe_a2a_backend=deepep` *after* the model overrides run, so a gate there would let the
+wrong-output path back in. It is a no-op whenever `require_attn_tp_gather()` would have
+returned False anyway. `require_attn_tp_gather`'s own comment already describes HYV4's case:
 *"Opt-out for models that manage SP scatter/gather at the model level and do not consume
 the upstream gathered_buffer."* HYV4 is such a model and simply is not opted out.
 
@@ -164,12 +188,21 @@ make them reviewable.
 
 ## Order to send
 
-1. **D as an issue** (evidence above), with the `model_overrides/hunyuan_v4.py` PR
-   attached as the cheap fix. Highest severity; independent of everything else.
-2. **A** (6 lines) and **A′** (2 lines) as two small PRs. Both are unambiguous bugs with
-   no perf claim attached.
+1. ~~**D as an issue**, with the override PR attached as the cheap fix.~~ **Sent**:
+   [#38606](https://github.com/sgl-project/sglang/issues/38606) +
+   [#38607](https://github.com/sgl-project/sglang/pull/38607).
+2. ~~**A** and **A′** as two small PRs.~~ **Sent**:
+   [#38608](https://github.com/sgl-project/sglang/pull/38608) (12 lines) and
+   [#38609](https://github.com/sgl-project/sglang/pull/38609) (6/−3). #38609 does not
+   depend on #38608.
 3. **C**, once the group-32 unit test exists.
 4. **B1**, on top of C, with the "no MXFP8 dispatch on CUDA" reasoning stated up front.
+
+What the three sent PRs say about validation, so a reviewer's reply is not a surprise:
+each one states that its unit tests were **not run locally** (no torch-capable
+environment on the Mac they were written on), #38607 states plainly that it makes the arm
+**slower** (2711.81 → 2324.38 out tok/s at c=64, which is the cost of routing 8× the
+tokens), and #38608/#38609 carry no perf claim at all.
 
 Nothing here is blocked on hardware. A, A′ and D are pure source changes reviewable
 without a B300; C and B1 want one B300-hour each to re-confirm on a fresh `main` build

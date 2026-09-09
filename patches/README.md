@@ -555,8 +555,13 @@ The real upstream fix is one of: give `hunyuan_v4.py` a `LayerCommunicator`, or
 force `disable_attn_tp_gather` for architectures that have none. The second has an
 idiomatic channel — `srt/arg_groups/model_overrides/`, 30 files keyed on
 `hf_config.architectures[0]`, and `require_attn_tp_gather`'s own comment already
-describes this class of model as the reason `disable_attn_tp_gather` exists. Not
-filed yet; it is the top item in `../UPSTREAM.md`.
+describes this class of model as the reason `disable_attn_tp_gather` exists. **Filed
+2026-09-09** as [issue #38606](https://github.com/sgl-project/sglang/issues/38606) with
+[PR #38607](https://github.com/sgl-project/sglang/pull/38607) doing the second — the
+declaration lands in the existing `model_overrides/deepseek_v2.py` (HYV4 is already in
+its `@_register_for` list), and it is unconditional, because `--enable-waterfill` sets
+`moe_a2a_backend=deepep` in a post-process that runs after the overrides. See
+`../UPSTREAM.md`.
 
 **This retracts a throughput row, and the direction it moved is the point.** The TP8
 `deepep` bench taken before the flag existed reported **2711.81 out tok/s at c=64
