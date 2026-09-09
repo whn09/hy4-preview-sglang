@@ -174,6 +174,14 @@ defaults -- which is why `--check` above exits 0 and `04_fix_multinic_routing.sh
 is a no-op here. Run the `--check` anyway: it costs nothing and it is the
 difference between knowing and assuming.
 
+The command above runs the stock `lmsysorg/sglang:hy4-preview` and lets
+`build_efa_args` mount the host's EFA stack into it. `hy4-preview-efa:latest`
+(§4, in ECR for us-east-2) is now on all four p5en and needs no injection --
+`IMAGE=hy4-preview-efa:latest ...`. Prefer it for anything multi-run: it pins
+libfabric, aws-ofi-nccl and pip NCCL 2.31.2 inside the image, so two hosts cannot
+end up with different EFA stacks. It is also *required* for the PD arms, whose
+Mooncake KV transfer needs libfabric in-image regardless of NCCL.
+
 `93_check_efa.sh` exists because no log answers this question: at
 `NCCL_DEBUG=WARN` the transport is never printed, and at `INFO` you have to know
 to look for `NET/OFI` vs `NET/Socket`. The counters cannot be faked by a
@@ -522,14 +530,41 @@ message's suggested `expandable_segments:True` must never be used with Mooncake.
 Every resulting KV pool is >= 1.35M tokens against the ~262k this workload needs,
 so that is not a throughput confound.
 
-### p5en 2-node BF16 TP16: a TCP-fallback baseline only
+### p5en 2-node BF16 TP16, over EFA
 
-This arm ran before the EFA fix existed, so it is a socket number, kept because
-it is the only cross-node TP measurement in the file and because the size of the
-effect is the point.
+Measured 2026-09-09 on P5EN-3/4, `QUANT=bf16 A2A_BACKEND=none NNODES=2
+TP_SIZE=16` (`EP` is not stamped by this build, hence `epunknown`), 16 H200s:
 
-Measured 2026-09-09 on P5EN-3/4, `A2A_BACKEND=none NNODES=2 TP_SIZE=16
-QUANT=bf16` on stock `lmsysorg/sglang:hy4-preview`:
+| quant | topo | moe | profile | spec | ISL/OSL | conc | reqs | dur (s) | TTFT p50 (ms) | TPOT p50 (ms) | ITL p50 (ms) | E2E p50 (ms) | out tok/s | GPUs | out tok/s/GPU |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| bf16 | tp16x2node | none/epunknown | low-latency | on | 1024/1024 | 1 | 32 | 268.58 | 178.40 | 7.55 | 7.44 | 7899.52 | 122.00 | 16 | 7.62 |
+| bf16 | tp16x2node | none/epunknown | low-latency | on | 1024/1024 | 16 | 32 | 37.54 | 764.76 | 14.58 | 13.24 | 15794.62 | 872.87 | 16 | 54.55 |
+| bf16 | tp16x2node | none/epunknown | low-latency | on | 1024/1024 | 64 | 128 | 80.60 | 3180.57 | 23.36 | 19.52 | 28427.33 | 1626.30 | 16 | 101.64 |
+| bf16 | tp16x2node | none/epunknown | low-latency | on | 1024/1024 | 256 | 512 | 297.28 | 113588.25 | 25.31 | 19.68 | 139361.95 | 1763.63 | 16 | 110.23 |
+
+Throughput saturates between c=64 and c=256 (+8.4% for 4x the concurrency)
+while TTFT p50 goes 3.2 s -> 113.6 s, i.e. c=256 is past the admission wall and
+only the c<=64 rows are usable operating points. Spec is on, so
+`max_running_requests` is 48 (§4) -- 256 concurrent requests queue behind 48
+slots.
+
+#### What the transport was worth: the same c=1 point on TCP
+
+The first attempt at this arm ran before the EFA fix existed and landed on
+sockets. Both runs survive, as
+`results/bf16-tp16x2node-TCPFALLBACK-README.md` and the pair it documents:
+
+| c=1 | out tok/s | TTFT p50 (ms) | TPOT p50 (ms) | dur (s) |
+|---|---|---|---|---|
+| TCP over ENA | 46.31 | 555.52 | 19.78 | 707.5 |
+| EFA | **122.00** | 178.40 | **7.55** | 268.6 |
+| | **2.63x** | 3.11x | **-61.8%** | |
+
+Independent confirmation from the server logs on either side of the container
+restart: `gen throughput` at bs=1 went 53.64 -> 130.37 tok/s, a 2.43x step
+against 2.63x at the bench level.
+
+The socket run's anatomy, which is why the effect is this large:
 
 | | |
 |---|---|
@@ -549,8 +584,12 @@ collective, 2 all-reduces x 78 layers *are* the entire cross-node traffic. The
 pre-existing `require_gin_capable_image` guard was scoped to `deepep*`, which is
 exactly why this got through.
 
-The fix, and why mounting `/opt/amazon` alone is not enough, is in §4. No
-post-fix p5en number exists yet -- see §5.
+The fix, and why mounting `/opt/amazon` alone is not enough, is in §4. Two
+process changes came out of this file rather than out of the measurement: the
+transport is now an axis in `TOPO` (`-efa` / `-tcp`, from `build_efa_args`), and
+`91_bench.sh` rotates a same-tag pair into `results/superseded/` instead of
+truncating the `.log` while appending the `.json` -- which is how these two runs
+came to share one filename in the first place.
 
 ### Not measured: `deepep_v2` cannot serve this checkpoint at all
 
@@ -824,13 +863,47 @@ results header.
 
 #### Build once, pull everywhere (ECR)
 
+Two repositories, because ECR is regional and a cross-region pull of a 49.7 GB
+image is not worth it. Same tag scheme, same Dockerfile:
+
 ```
-579019700964.dkr.ecr.ap-northeast-2.amazonaws.com/hy4-preview-sglang-b300
+579019700964.dkr.ecr.ap-northeast-2.amazonaws.com/hy4-preview-sglang-b300   # B300
+579019700964.dkr.ecr.us-east-2.amazonaws.com/hy4-preview-sglang             # p5en
   :efa1.50.0-nccl2.31.2-mc0.3.13.post1     <- use this
   :latest                                  <- convenience alias, moves
 ```
 
-`bash 05_pull_pd_image.sh` pulls it, aliases it to `hy4-preview-efa:latest`, and
+The us-east-2 copy was built on P5EN-3 and pushed 2026-09-09
+(`sha256:9e4804af`), then pulled onto P5EN-1/2/4 -- the whole point being that
+only one host pays the build. Push side, if the tag ever needs to move:
+
+```bash
+aws ecr create-repository --region us-east-2 --repository-name hy4-preview-sglang
+aws ecr get-login-password --region us-east-2 \
+  | docker login --username AWS --password-stdin \
+      579019700964.dkr.ecr.us-east-2.amazonaws.com
+docker build -t hy4-preview-efa:latest -f Dockerfile .
+docker tag hy4-preview-efa:latest \
+  579019700964.dkr.ecr.us-east-2.amazonaws.com/hy4-preview-sglang:efa1.50.0-nccl2.31.2-mc0.3.13.post1
+docker push \
+  579019700964.dkr.ecr.us-east-2.amazonaws.com/hy4-preview-sglang:efa1.50.0-nccl2.31.2-mc0.3.13.post1
+```
+
+The three version numbers in the tag are read out of the *built image*, not
+assumed: `/opt/amazon/efa_installed_packages`'s installer version (1.50.0, which
+ships libfabric 2.6.0 -- they are different numbers and both appear), the pip
+`nvidia-nccl-cu13` version, and the `mooncake-transfer-engine-efa-cuda13` dist
+version. Tagging from the Dockerfile's *intent* instead is how an image ends up
+labelled with a version it does not contain.
+
+Pull side, on p5en (the defaults in `05_pull_pd_image.sh` point at the B300
+repository):
+
+```bash
+ECR_REGION=us-east-2 ECR_REPO=hy4-preview-sglang bash 05_pull_pd_image.sh
+```
+
+It pulls, aliases to `hy4-preview-efa:latest`, and
 then **verifies the three EFA discriminators inside the pulled image** before
 declaring success -- a pull that resolved to a non-EFA build fails there rather
 than hours later as `mooncake session ... is not alive`.
@@ -950,11 +1023,16 @@ and none of the above.
   `results/` holds a header-only log that `gen_bench_table.py` reports under
   "NO rc IN HEADER" rather than treating as a row. That is the point which would
   locate the MTP crossover, if there is one.
-* **No p5en figure is a real number.** Every one of them is the TCP-fallback run,
-  taken before `build_efa_args` existed. Re-run the same arm now that the host EFA
-  stack is injected, confirm the transport
-  (`NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=INIT,NET`, then `grep -m1 'NET/'`), and run
-  the 1/16/64/256 ladder at 1k/1k so it can be set against a B300 TP8 row.
+* **The p5en ladder has never been cross-checked against a B300 row at matched
+  口径.** The four EFA rows exist now (§3), but the B300 rows are MXFP8 TP8 on one
+  node and these are BF16 TP16 on two, so the pair differs in quantization,
+  tensor-parallel width *and* node count at once. The comparison that would mean
+  something is **BF16 TP8 on one B300** -- also listed below, and the cheapest way
+  to isolate the quantization axis.
+* **No p5en run has had its transport confirmed from inside the container.** The
+  four EFA rows are attributed by NIC counters and by the 2.63x step (§3), which
+  is strong, but `NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=INIT,NET` then
+  `grep -m1 'NET/'` is the direct evidence and costs one relaunch.
 * `04_fix_multinic_routing.sh`'s **fix path** has only ever been exercised on
   p6-b300. On p5en there is nothing for it to fix (§2): its `--check` correctly
   reports "single-NIC node", so what is untested there is only the no-op branch.
