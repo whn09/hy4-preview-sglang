@@ -146,8 +146,9 @@ The only p5en geometry that exists, for the three reasons in §4. Both hosts run
 the same line but `NODE_RANK`.
 
 ```bash
-# both hosts, after every boot -- 16 EFA ENIs, same trap as the B300 hosts (§4)
-bash 04_fix_multinic_routing.sh
+# read-only guard, both hosts. On these it prints "single-NIC node, no rule
+# needed" and there is nothing to run -- see below.
+bash 04_fix_multinic_routing.sh --check
 
 # P5EN-3 (rank 0, the only host that binds :$PORT)
 QUANT=bf16 NNODES=2 NODE_RANK=0 TP_SIZE=16 MEM_FRACTION=0.90 \
@@ -163,6 +164,15 @@ bash 93_check_efa.sh          # reads the NIC counters; exits 1 on TCP fallback
 `DIST_INIT_ADDR` is rank 0's **private (ENA)** IP and must be the same string on
 both hosts; it changes on a stop/start, so read it rather than reuse the one above.
 Only rank 0 binds `:$PORT` -- do not wait for "server is fired up" on rank 1.
+
+**These hosts do not have the §4 routing trap**, despite having 16 EFA NICs each.
+That trap is caused by multiple ENA *interface* ENIs sharing one subnet; an
+efa-only ENI carries no IP interface, so it cannot cause it however many there
+are. Measured 2026-09-09 on P5EN-3/4: one ENA interface each (`enp71s0`), zero
+same-subnet kernel routes on any other interface, no `ip rule` beyond the three
+defaults -- which is why `--check` above exits 0 and `04_fix_multinic_routing.sh`
+is a no-op here. Run the `--check` anyway: it costs nothing and it is the
+difference between knowing and assuming.
 
 `93_check_efa.sh` exists because no log answers this question: at
 `NCCL_DEBUG=WARN` the transport is never printed, and at `INFO` you have to know
@@ -766,6 +776,13 @@ on **both** ends -- the drop is on the reply path -- and it is **not persistent*
 by design, so it is lost on every reboot. Verified 2026-09-05: all 12 ordered
 pairs across B300-1/2/3/4 ping after it, none of the cross pairs did before.
 
+The cause is the ENA *interface* ENIs, not the EFA ones: an efa-only ENI has no IP
+interface and never enters the main table, so a host with 16 of them and a single
+ENA interface is not affected at all. `--check` decides this from the ENI
+inventory (it fails only when same-subnet routes exist on other interfaces *and*
+the rule is absent), so it is safe to run everywhere; on the p5en pair it prints
+"single-NIC node, no rule needed".
+
 ### PD: why it needs its own image
 
 The KV cache crosses the wire, and on p6-b300 that wire is EFA. The stock image
@@ -938,9 +955,9 @@ and none of the above.
   stack is injected, confirm the transport
   (`NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=INIT,NET`, then `grep -m1 'NET/'`), and run
   the 1/16/64/256 ladder at 1k/1k so it can be set against a B300 TP8 row.
-* **`04_fix_multinic_routing.sh` has never been exercised on p5en's 16 EFA ENIs**,
-  only on p6-b300's 18. It is written from the ENI inventory rather than a fixed
-  count, but that is untested here.
+* `04_fix_multinic_routing.sh`'s **fix path** has only ever been exercised on
+  p6-b300. On p5en there is nothing for it to fix (§2): its `--check` correctly
+  reports "single-NIC node", so what is untested there is only the no-op branch.
 * **TP32 on four p5en** is legal arithmetic and nothing more.
 * **BF16 TP8 on B300** has never been run, though it is a verified cookbook cell.
 * **`EP_SIZE=8 A2A_BACKEND=none` vs pure TP** at TP8 has never been measured. It
