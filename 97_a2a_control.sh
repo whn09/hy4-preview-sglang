@@ -58,6 +58,12 @@ if [[ "$A2A" != "none" ]]; then
                --deepep-dispatcher-output-dtype "$DISPATCH_DTYPE")
 fi
 
+# -w /: preventive, same reason as in 91_bench.sh. `launch_server` happens to
+# resolve today because it exists only under python/sglang, but any module whose
+# name collides with a directory at the repo root (`benchmark/`, `test/`,
+# `examples/`) is shadowed by the WORKDIR=/sgl-workspace entry on sys.path[0].
+# `sglang.bench_serving` already broke this way on 2026-09-09.
+#
 # Same reason as the Hy4 arms: with a2a=none the standard pre-permute picks the
 # MASKED grouped-GEMM layout by a memory budget while DeepEP-normal always takes
 # the COMPACT one, so an unpinned reference is not a control for the compact path.
@@ -69,6 +75,7 @@ docker run -d --name "$NAME" --init \
     --net=host --ipc=host --privileged \
     --ulimit memlock=-1 --ulimit stack=67108864 \
     --device=/dev/infiniband --shm-size=32g \
+    -w / \
     -v "$MODEL_DIR:/model:ro" \
     -e SGLANG_DEEPGEMM_STANDARD_LAYOUT="$LAYOUT" \
     --entrypoint python3 "$IMAGE" \

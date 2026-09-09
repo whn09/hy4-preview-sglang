@@ -150,7 +150,26 @@ echo "log  : ${LOG}"
 # as /models/Hy4-preview-FP8 and bench_serving would otherwise try to resolve that
 # as an HF repo id ("Repo id must be in the form 'repo_name' or
 # 'namespace/repo_name'").
+# -w /: the image's WORKDIR is /sgl-workspace, so `python -m` puts that on
+# sys.path[0] -- ahead of site-packages -- and the git checkout at
+# /sgl-workspace/sglang (no __init__.py) joins the installed `sglang` package as an
+# implicit NAMESPACE package. Modules that exist only under python/sglang are
+# still found through the merged path, which is why launch_server works and this
+# looked fine for months. But `benchmark` exists in BOTH trees: the repo root's
+# benchmark/ (gsm8k, hellaswag, deepseek_v3 -- the standalone scripts) wins on
+# path order, and since it too has no __init__.py the search stops there. So
+# sglang 0.5.18's `bench_serving.py`, now a shim that does
+#   from sglang.benchmark.serving import *
+# dies with "No module named 'sglang.benchmark.serving'" while
+# python/sglang/benchmark/serving.py sits right there. Running from / removes the
+# shadowing entry; every path this script passes in is already absolute.
+#
+# Measured 2026-09-09 on P5EN-1 against hy4-preview-efa:latest: fails at the image
+# WORKDIR, `--help` works with -w /. The older image did not hit it because
+# bench_serving was still the implementation rather than a shim -- i.e. this is the
+# moving `lmsysorg/sglang:hy4-preview` tag (§4) landing on us.
 docker run --rm --name "hy4-bench-$$" --net=host \
+    -w / \
     -v "$HOST_MODEL_DIR/$MODEL_DIRNAME:$RUN_MPATH:ro" \
     -v "$RESULTS_DIR:/results" \
     --entrypoint python3 "$BENCH_IMAGE" \
